@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Eufy Camera Viewer</title>
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
+    <style>
+      :root { color-scheme: dark; }
+      *, *::before, *::after { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: #0b1020;
+        color: #e8ecff;
+      }
+      header {
+        display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+        padding: 14px 20px; background: #101828; border-bottom: 1px solid #1e2d50;
+      }
+      header h2 { margin: 0; font-size: 1rem; flex: 1; white-space: nowrap; }
+      .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      button {
+        background: #0f1430; color: #e8ecff; border: 1px solid #33407a;
+        border-radius: 8px; padding: 7px 12px; font-size: 0.85rem; cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      button.danger { border-color: #7a3333; }
+      button.danger:hover { background: #3a1010; }
+      #statusBar {
+        padding: 6px 20px; font-size: 0.8rem; background: #0d1525;
+        border-bottom: 1px solid #1e2d50; min-height: 28px;
+      }
+      #grid {
+        display: grid; grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+        gap: 12px; padding: 16px;
+      }
+      .cam-tile {
+        background: #111827; border: 1px solid #1e2d50; border-radius: 10px;
+        overflow: hidden; display: flex; flex-direction: column;
+      }
+      .cam-tile-header {
+        display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+        background: #151c34; font-size: 0.82rem; min-height: 36px;
+      }
+      .cam-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .cam-badge { font-size: 0.7rem; padding: 2px 7px; border-radius: 20px; white-space: nowrap; }
+      .badge-online { background: #14532d; color: #86efac; }
+      .badge-offline { background: #3b0000; color: #fca5a5; }
+      .badge-connecting { background: #1e3a00; color: #d9f99d; }
+      .badge-streaming { background: #0c4a6e; color: #7dd3fc; }
+      .badge-error { background: #450a0a; color: #fca5a5; }
+      .cam-video-wrap { position: relative; background: #000; aspect-ratio: 16/9; }
+      .cam-video-wrap video { width: 100%; height: 100%; object-fit: contain; display: block; }
+      .cam-overlay {
+        position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+        font-size: 0.85rem; color: #94a3b8; background: rgba(0,0,0,0.55); pointer-events: none;
+      }
+      .cam-overlay.hidden { display: none; }
+      .cam-controls {
+        display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 8px;
+        background: #10182b; border-top: 1px solid #1e2d50;
+      }
+      .cam-controls button { padding: 5px 10px; font-size: 0.78rem; }
+      .cam-log {
+        font-size: 0.72rem; color: #64748b; padding: 4px 8px 6px; max-height: 56px;
+        overflow-y: auto; font-family: monospace; line-height: 1.4;
+      }
+      .log-ok { color: #86efac; }
+      .log-warn { color: #fde68a; }
+      .log-err { color: #fca5a5; }
+
+      #authOverlay {
+        position: fixed; inset: 0; z-index: 10;
+        display: none; align-items: center; justify-content: center;
+        background: rgba(5, 8, 18, 0.92);
+      }
+      #authOverlay.show { display: flex; }
+      .auth-card {
+        width: min(420px, 92vw); background: #111827; border: 1px solid #1e2d50;
+        border-radius: 12px; padding: 22px; text-align: center;
+      }
+      .auth-card h3 { margin: 0 0 6px; font-size: 1.05rem; }
+      .auth-msg { color: #93a4cc; font-size: 0.85rem; margin-bottom: 14px; min-height: 18px; }
+      #authCaptcha {
+        max-width: 100%; background: #fff; border-radius: 6px; margin-bottom: 14px;
+        display: none;
+      }
+      .auth-row { display: flex; gap: 8px; }
+      #authInput {
+        flex: 1; background: #0f1430; color: #e8ecff; border: 1px solid #33407a;
+        border-radius: 8px; padding: 9px 12px; font-size: 1rem; letter-spacing: 1px;
+      }
+      #authSubmit {
+        background: #1e3a8a; color: #dbeafe; border: 1px solid #6495ed;
+        border-radius: 8px; padding: 9px 16px; font-size: 0.9rem; cursor: pointer;
+      }
+      #authSubmit:disabled { opacity: 0.5; cursor: not-allowed; }
+      .auth-err { color: #fca5a5; font-size: 0.8rem; margin-top: 10px; min-height: 16px; }
+      .auth-spinner {
+        width: 26px; height: 26px; margin: 6px auto 14px; border-radius: 50%;
+        border: 3px solid #1e2d50; border-top-color: #6495ed; animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .auth-card.connecting #authForm { display: none; }
+      .auth-card:not(.connecting) .auth-spinner { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="authOverlay">
+      <div class="auth-card" id="authCard">
+        <h3 id="authTitle">Connecting to Eufy…</h3>
+        <div class="auth-msg" id="authMsg"></div>
+        <div class="auth-spinner"></div>
+        <form id="authForm">
+          <img id="authCaptcha" alt="captcha" />
+          <div class="auth-row">
+            <input id="authInput" autocomplete="one-time-code" autocapitalize="off"
+              spellcheck="false" placeholder="Enter code" />
+            <button id="authSubmit" type="submit">Submit</button>
+          </div>
+          <div class="auth-err" id="authErr"></div>
+        </form>
+      </div>
+    </div>
+
+    <header>
+      <h2>🛡️ Eufy Camera Viewer</h2>
+      <div class="toolbar">
+        <button id="refreshBtn">↺ Refresh</button>
+        <button id="startAllBtn">▶ Start All</button>
+        <button id="stopAllBtn" class="danger">■ Stop All</button>
+      </div>
+    </header>
+    <div id="statusBar">Connecting…</div>
+    <div id="grid"></div>
+
+    <script>
+      const statusBar = document.getElementById("statusBar");
+      const grid = document.getElementById("grid");
+      const sessions = new Map();
+
+      function escHtml(str) {
+        return String(str).replace(/[&<>"']/g, (c) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+      }
+
+      class StreamSession {
+        constructor(camera, els) {
+          this.camera = camera;
+          this.els = els;
+          this.player = null;
+        }
+
+        log(msg, level = "") {
+          const ts = new Date().toTimeString().slice(0, 8);
+          const line = document.createElement("div");
+          if (level) line.className = `log-${level}`;
+          line.textContent = `[${ts}] ${msg}`;
+          this.els.logEl.appendChild(line);
+          this.els.logEl.scrollTop = this.els.logEl.scrollHeight;
+        }
+
+        setBadge(text, cls) {
+          this.els.badge.textContent = text;
+          this.els.badge.className = `cam-badge ${cls}`;
+        }
+
+        setOverlay(text) {
+          if (text) {
+            this.els.overlay.textContent = text;
+            this.els.overlay.classList.remove("hidden");
+          } else {
+            this.els.overlay.classList.add("hidden");
+          }
+        }
+
+        start() {
+          if (!mpegts.isSupported()) {
+            this.log("MSE not supported in this browser", "err");
+            this.setOverlay("Browser unsupported");
+            return;
+          }
+          this.stop();
+          this.setBadge("Connecting…", "badge-connecting");
+          this.setOverlay("Starting livestream…");
+          this.log("Connecting…");
+
+          const proto = location.protocol === "https:" ? "wss" : "ws";
+          const url = `${proto}://${location.host}/stream?sn=${encodeURIComponent(this.camera.sn)}`;
+
+          this.player = mpegts.createPlayer(
+            { type: "mpegts", isLive: true, url },
+            {
+              enableWorker: true,
+              liveBufferLatencyChasing: true,
+              liveBufferLatencyMaxLatency: 2.0,
+              liveBufferLatencyMinRemain: 0.5,
+            }
+          );
+          this.player.attachMediaElement(this.els.video);
+
+          this.player.on(mpegts.Events.ERROR, (type, detail) => {
+            this.log(`Stream error: ${type} ${detail}`, "err");
+            this.setBadge("Error", "badge-error");
+            this.setOverlay(`Error: ${detail}`);
+          });
+          this.els.video.addEventListener(
+            "playing",
+            () => {
+              this.setOverlay(null);
+              this.setBadge("● Live", "badge-streaming");
+              this.log("Streaming", "ok");
+            },
+            { once: true }
+          );
+
+          this.player.load();
+          this.player.play().catch((err) => this.log(`play() failed: ${err.message}`, "err"));
+        }
+
+        stop() {
+          if (this.player) {
+            try { this.player.pause(); } catch (_) {}
+            try { this.player.unload(); } catch (_) {}
+            try { this.player.detachMediaElement(); } catch (_) {}
+            try { this.player.destroy(); } catch (_) {}
+            this.player = null;
+          }
+          this.els.video.removeAttribute("src");
+          this.setBadge(this.camera.online ? "Online" : "Offline",
+            this.camera.online ? "badge-online" : "badge-offline");
+          this.setOverlay(this.camera.online ? "Click Start" : "Camera offline");
+        }
+      }
+
+      function buildGrid(cameras) {
+        sessions.forEach((s) => s.stop());
+        sessions.clear();
+        grid.innerHTML = "";
+
+        for (const camera of cameras) {
+          const tile = document.createElement("div");
+          tile.className = "cam-tile";
+          tile.dataset.sn = camera.sn;
+          tile.innerHTML = `
+            <div class="cam-tile-header">
+              <span class="cam-name">${escHtml(camera.name)}</span>
+              <span class="cam-badge ${camera.online ? "badge-online" : "badge-offline"}">
+                ${camera.online ? "Online" : "Offline"}
+              </span>
+            </div>
+            <div class="cam-video-wrap">
+              <video autoplay playsinline muted controls></video>
+              <div class="cam-overlay">${camera.online ? "Click Start" : "Camera offline"}</div>
+            </div>
+            <div class="cam-log"></div>
+            <div class="cam-controls">
+              <button class="start-btn">▶ Start</button>
+              <button class="stop-btn">■ Stop</button>
+            </div>`;
+          grid.appendChild(tile);
+
+          const els = {
+            video: tile.querySelector("video"),
+            overlay: tile.querySelector(".cam-overlay"),
+            badge: tile.querySelector(".cam-badge"),
+            logEl: tile.querySelector(".cam-log"),
+          };
+          const session = new StreamSession(camera, els);
+          sessions.set(camera.sn, session);
+
+          tile.querySelector(".start-btn").addEventListener("click", () => session.start());
+          tile.querySelector(".stop-btn").addEventListener("click", () => session.stop());
+        }
+      }
+
+      let retryTimer = null;
+      async function loadCameras() {
+        clearTimeout(retryTimer);
+        statusBar.textContent = "Loading cameras…";
+        const res = await fetch("/api/cameras");
+        const data = await res.json();
+        if (res.status === 503) {
+          // Cloud session not up yet (often a 2FA/captcha prompt in the
+          // terminal). Show the reason and retry automatically.
+          statusBar.textContent = `${data.error} — retrying…`;
+          retryTimer = setTimeout(() => loadCameras().catch(() => {}), 3000);
+          return;
+        }
+        if (!res.ok) throw new Error(data.error || "Failed to load cameras");
+        buildGrid(data.cameras);
+        const online = data.cameras.filter((c) => c.online).length;
+        statusBar.textContent = `${data.cameras.length} cameras — ${online} online`;
+      }
+
+      document.getElementById("refreshBtn").addEventListener("click", () => {
+        loadCameras().catch((err) => (statusBar.textContent = "Error: " + err.message));
+      });
+      document.getElementById("startAllBtn").addEventListener("click", () => {
+        sessions.forEach((s) => s.camera.online && s.start());
+      });
+      document.getElementById("stopAllBtn").addEventListener("click", () => {
+        sessions.forEach((s) => s.stop());
+      });
+
+      // --- Auth flow: show captcha / 2FA challenge before loading cameras ----
+      const authOverlay = document.getElementById("authOverlay");
+      const authCard = document.getElementById("authCard");
+      const authTitle = document.getElementById("authTitle");
+      const authMsg = document.getElementById("authMsg");
+      const authCaptcha = document.getElementById("authCaptcha");
+      const authForm = document.getElementById("authForm");
+      const authInput = document.getElementById("authInput");
+      const authSubmit = document.getElementById("authSubmit");
+      const authErr = document.getElementById("authErr");
+
+      let authPollTimer = null;
+      let started = false;
+
+      function renderAuth(data) {
+        authMsg.textContent = data.message || "";
+        const isCaptcha = data.status === "captcha";
+        const isTfa = data.status === "tfa";
+        const isConnecting = data.status === "connecting";
+        const isError = data.status === "error";
+
+        authCard.classList.toggle("connecting", isConnecting);
+        authTitle.textContent = isCaptcha
+          ? "Enter captcha"
+          : isTfa
+            ? "Enter 2FA code"
+            : isError
+              ? "Login failed"
+              : "Connecting to Eufy…";
+
+        if (isCaptcha && data.captcha) {
+          authCaptcha.src = data.captcha;
+          authCaptcha.style.display = "block";
+        } else {
+          authCaptcha.removeAttribute("src");
+          authCaptcha.style.display = "none";
+        }
+
+        if (isCaptcha || isTfa) {
+          authInput.disabled = false;
+          authSubmit.disabled = false;
+          authInput.value = "";
+          authInput.focus();
+        }
+        if (isError) authErr.textContent = data.message || "Login failed.";
+      }
+
+      async function pollAuth() {
+        clearTimeout(authPollTimer);
+        let data;
+        try {
+          const res = await fetch("/api/auth/status");
+          data = await res.json();
+        } catch (_) {
+          authPollTimer = setTimeout(pollAuth, 2000);
+          return;
+        }
+
+        if (data.connected || data.status === "connected") {
+          authOverlay.classList.remove("show");
+          if (!started) {
+            started = true;
+            loadCameras().catch((err) => (statusBar.textContent = "Error: " + err.message));
+          }
+          return;
+        }
+
+        authOverlay.classList.add("show");
+        renderAuth(data);
+        // Keep polling so a freshly-issued captcha image (new id) is picked up
+        // even while the user is looking at the old one.
+        authPollTimer = setTimeout(pollAuth, data.status === "connecting" ? 1500 : 4000);
+      }
+
+      authForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const code = authInput.value.trim();
+        if (!code) return;
+        authErr.textContent = "";
+        authInput.disabled = true;
+        authSubmit.disabled = true;
+        authCard.classList.add("connecting");
+        try {
+          const res = await fetch("/api/auth/submit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code }),
+          });
+          const data = await res.json();
+          if (!res.ok) authErr.textContent = data.error || "Submit failed.";
+        } catch (err) {
+          authErr.textContent = err.message;
+        }
+        pollAuth();
+      });
+
+      pollAuth();
+    </script>
+  </body>
+</html>
