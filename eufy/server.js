@@ -19,6 +19,7 @@
  *   GET  /api/auth/status   — { status, message, captcha?, connected }
  *   POST /api/auth/submit   — { code } -> answers the pending captcha/2FA
  *   GET  /api/cameras       — { cameras: [{ sn, name, model, online }] }
+ *   GET  /api/events        — Server-Sent Events: detection notifications
  *   GET  /api/health        — { ok, connected }
  *   WS   /stream?sn=<SN>    — binary MPEG-TS stream for one camera
  */
@@ -68,6 +69,20 @@ const config = {
 const sessions = new Map();
 let eufy = null;
 let connected = false;
+
+// Open Server-Sent Events connections (the viewer subscribes to /api/events to
+// be told when a detection fires, so it can auto-pop the live view).
+const sseClients = new Set();
+function broadcastEvent(obj) {
+  const data = `data: ${JSON.stringify(obj)}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(data);
+    } catch (_) {
+      sseClients.delete(res);
+    }
+  }
+}
 
 function resolveFfmpegPath() {
   try {
@@ -213,6 +228,17 @@ async function initEufy() {
   });
   eufy.on("device added", (device) => {
     log(`Device: ${device.getName()} (${device.getSerial()}) camera=${device.isCamera()}`);
+  });
+
+  // Push-delivered detection. `state` is true on start, false on end — we only
+  // act on the rising edge. The viewer auto-pops the matching camera's live
+  // view for a few seconds. (Requires Person Detection enabled for the camera
+  // in the Eufy app.)
+  eufy.on("device person detected", (device, state) => {
+    if (!state || !device.isCamera()) return;
+    const sn = device.getSerial();
+    log(`👤 Person detected on ${device.getName()} (${sn}) — notifying viewers`);
+    broadcastEvent({ type: "person", sn, name: device.getName(), ts: Date.now() });
   });
 
   // A livestream we requested has started — route its streams to the matching
@@ -405,6 +431,29 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && requestUrl.pathname === "/api/health") {
       sendJson(res, 200, { ok: true, connected });
+      return;
+    }
+
+    // Server-Sent Events: pushes detection notifications to the viewer.
+    if (req.method === "GET" && requestUrl.pathname === "/api/events") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      res.write(": connected\n\n");
+      sseClients.add(res);
+      const heartbeat = setInterval(() => {
+        try {
+          res.write(": hb\n\n");
+        } catch (_) {
+          /* closed */
+        }
+      }, 25000);
+      req.on("close", () => {
+        clearInterval(heartbeat);
+        sseClients.delete(res);
+      });
       return;
     }
 

@@ -150,6 +150,22 @@
           this.camera = camera;
           this.els = els;
           this.player = null;
+          this.autoStarted = false;
+          this.autoStopTimer = null;
+        }
+
+        // Triggered by a detection event: pop the live view for `ms`, then stop.
+        // Leaves a manually-started stream alone (no surprise auto-stop).
+        autoCapture(ms) {
+          if (this.player && !this.autoStarted) {
+            this.log("👤 Person detected (already streaming)", "warn");
+            return;
+          }
+          if (!this.player) this.start();
+          this.autoStarted = true;
+          clearTimeout(this.autoStopTimer);
+          this.autoStopTimer = setTimeout(() => this.stop(), ms);
+          this.log(`👤 Person detected — auto-streaming ${ms / 1000}s`, "warn");
         }
 
         log(msg, level = "") {
@@ -220,6 +236,9 @@
         }
 
         stop() {
+          clearTimeout(this.autoStopTimer);
+          this.autoStopTimer = null;
+          this.autoStarted = false;
           if (this.player) {
             try { this.player.pause(); } catch (_) {}
             try { this.player.unload(); } catch (_) {}
@@ -401,6 +420,28 @@
       });
 
       pollAuth();
+
+      // --- Detection events: auto-pop the live view on a person detection ----
+      const AUTO_CAPTURE_MS = 5000;
+      function initEventStream() {
+        if (!window.EventSource) return;
+        const es = new EventSource("/api/events");
+        es.onmessage = (e) => {
+          let evt;
+          try {
+            evt = JSON.parse(e.data);
+          } catch (_) {
+            return;
+          }
+          if (evt.type === "person") {
+            const session = sessions.get(evt.sn);
+            if (session) session.autoCapture(AUTO_CAPTURE_MS);
+            else statusBar.textContent = `👤 Person detected on ${evt.name || evt.sn}`;
+          }
+        };
+        es.onerror = () => {}; // EventSource auto-reconnects
+      }
+      initEventStream();
     </script>
   </body>
 </html>
