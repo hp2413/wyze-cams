@@ -1,0 +1,14 @@
+{
+  "name": "wyze-cams-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser dashboard for live Wyze camera feeds and device control, built on the wyze-cams library.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.1"
+  }
+}

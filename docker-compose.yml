@@ -1,0 +1,19 @@
+services:
+  wyze-cams:
+    build: .
+    image: wyze-cams
+    container_name: wyze-cams
+    ports:
+      - "3030:3030"
+    # Your Wyze credentials live here (copy cam-frontend/.env.example).
+    env_file:
+      - cam-frontend/.env
+    # Override PERSIST_PATH from the env file so tokens land on the volume.
+    environment:
+      - PERSIST_PATH=/data
+    volumes:
+      - wyze-tokens:/data
+    restart: unless-stopped
+
+volumes:
+  wyze-tokens:

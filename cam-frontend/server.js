@@ -1,8 +1,8 @@
 /**
- * Minimal HTTP server backing example/public/viewer.html — a browser-based
- * Wyze camera viewer that uses WebRTC to play live streams.
+ * HTTP server backing public/viewer.html — a browser-based Wyze camera
+ * dashboard that uses WebRTC to play live streams and control devices.
  *
- * Run:    node viewer.js
+ * Run:    node server.js   (from the cam-frontend/ directory)
  * Open:   http://localhost:3030
  *
  * Routes:
@@ -12,6 +12,8 @@
  *                                      — { params: { signalingUrl, iceServers, clientId? }, cached }
  *   GET /api/snapshot?mac=             — { available, snapshot? }
  *   GET /api/thumbnail?url=            — proxies a thumbnail image (CORS workaround)
+ *   POST /api/camera/control           — { mac, productModel, action } toggles
+ *                                        floodlight/spotlight/siren/motion/recording/notifications/power
  *   GET /api/health                    — { ok: true }
  */
 
@@ -23,7 +25,9 @@ const path = require("path");
 const { URL } = require("url");
 const https = require("https");
 
-const WyzeAPI = process.env.LOCAL_DEV ? require("../src/index") : require("wyze-api");
+// Use the local fork's source (../src) so the dashboard runs against this
+// repo's fixes rather than a separately published package.
+const WyzeAPI = require("../src/index");
 
 const wyze = new WyzeAPI({
   username: process.env.USERNAME,
@@ -47,6 +51,46 @@ function sendHtml(res, html) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(html);
 }
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1e6) reject(new Error("Body too large"));
+    });
+    req.on("end", () => {
+      if (!body) return resolve({});
+      try {
+        resolve(JSON.parse(body));
+      } catch (err) {
+        reject(new Error("Invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+// Maps a control action to the wyze-api method that performs it; each takes
+// (mac, model). Cameras silently no-op on unsupported features (e.g. a
+// floodlight call to a camera without one), so the client surfaces any thrown
+// error in its per-camera log.
+const CAMERA_ACTIONS = {
+  floodlight_on: "cameraFloodLightOn",
+  floodlight_off: "cameraFloodLightOff",
+  spotlight_on: "cameraSpotLightOn",
+  spotlight_off: "cameraSpotLightOff",
+  siren_on: "cameraSirenOn",
+  siren_off: "cameraSirenOff",
+  motion_on: "cameraMotionOn",
+  motion_off: "cameraMotionOff",
+  recording_on: "cameraMotionRecordingOn",
+  recording_off: "cameraMotionRecordingOff",
+  notifications_on: "cameraNotificationsOn",
+  notifications_off: "cameraNotificationsOff",
+  power_on: "cameraTurnOn",
+  power_off: "cameraTurnOff",
+};
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -137,6 +181,28 @@ const server = http.createServer(async (req, res) => {
       await wyze.maybeLogin();
       const cameras = await wyze.getCameras();
       sendJson(res, 200, { count: cameras.length, cameras });
+      return;
+    }
+
+    if (req.method === "POST" && requestUrl.pathname === "/api/camera/control") {
+      const body = await readJsonBody(req);
+      const { mac, productModel, action } = body;
+      if (!mac || !productModel || !action) {
+        sendJson(res, 400, { error: "Missing mac, productModel, or action" });
+        return;
+      }
+      const method = CAMERA_ACTIONS[action];
+      if (!method) {
+        sendJson(res, 400, { error: `Unknown action: ${action}` });
+        return;
+      }
+      await wyze.maybeLogin();
+      try {
+        await wyze[method](mac, productModel);
+        sendJson(res, 200, { ok: true, action });
+      } catch (error) {
+        sendJson(res, 502, { error: `${action} failed: ${error.message}` });
+      }
       return;
     }
 

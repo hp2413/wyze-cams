@@ -178,6 +178,65 @@
         padding: 5px 10px;
         font-size: 0.78rem;
       }
+      .cam-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 6px 8px;
+        background: #10182b;
+        border-top: 1px solid #1e2d50;
+      }
+      .cam-controls button {
+        padding: 5px 9px;
+        font-size: 0.76rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .cam-controls button.on {
+        background: #1e3a8a;
+        border-color: #6495ed;
+        color: #dbeafe;
+      }
+      .cam-controls button.talk-active {
+        background: #7a1f1f;
+        border-color: #ef4444;
+        color: #fecaca;
+      }
+      .cam-controls .ctrl-sep {
+        width: 1px;
+        align-self: stretch;
+        background: #1e2d50;
+        margin: 0 2px;
+      }
+      .drag-handle {
+        cursor: grab;
+        color: #64748b;
+        font-size: 1rem;
+        user-select: none;
+        padding: 0 2px;
+      }
+      .drag-handle:active {
+        cursor: grabbing;
+      }
+      .expand-btn {
+        padding: 3px 8px !important;
+        font-size: 0.85rem;
+      }
+      .cam-tile.dragging {
+        opacity: 0.4;
+        outline: 2px dashed #6495ed;
+      }
+      .cam-tile.drop-target {
+        outline: 2px solid #6495ed;
+      }
+      .cam-tile.expanded {
+        grid-column: 1 / -1;
+      }
+      .cam-tile.expanded .cam-video-wrap {
+        aspect-ratio: auto;
+        height: 72vh;
+      }
       .cam-log {
         font-size: 0.72rem;
         color: #64748b;
@@ -270,6 +329,10 @@
           this.sessionToken = 0;
           this.startWaiters = [];
           this.incompatibleRetryCount = 0;
+          this.wantTalk = false;
+          this.localStream = null;
+          this.remoteStream = null;
+          this.muted = true;
         }
 
         log(msg, level = "") {
@@ -339,6 +402,17 @@
           this.setOverlay("Fetching stream…");
           this.els.startBtn.disabled = true;
 
+          if (this.wantTalk && !this.localStream) {
+            try {
+              this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+              this.log("Mic acquired (experimental talk)", "warn");
+            } catch (err) {
+              this.log(`Mic denied: ${err.message}`, "err");
+              this.wantTalk = false;
+              this.els.talkBtn?.classList.remove("talk-active");
+            }
+          }
+
           try {
             const res = await fetch(
               `/api/stream-params?mac=${encodeURIComponent(this.camera.mac)}` +
@@ -376,17 +450,69 @@
           }
         }
 
+        toggleMute() {
+          this.muted = !this.muted;
+          this.els.video.muted = this.muted;
+          if (this.els.muteBtn) {
+            this.els.muteBtn.textContent = this.muted ? "🔇 Muted" : "🔊 Sound";
+            this.els.muteBtn.classList.toggle("on", !this.muted);
+          }
+        }
+
+        async toggleTalk() {
+          if (this.wantTalk) {
+            this.wantTalk = false;
+            this.els.talkBtn?.classList.remove("talk-active");
+            this.log("Talk off — reconnecting receive-only");
+          } else {
+            this.wantTalk = true;
+            this.els.talkBtn?.classList.add("talk-active");
+            this.log("Talk on (experimental) — reconnecting", "warn");
+          }
+          if (this.camera.online) await this.start();
+        }
+
+        async control(action, btn) {
+          if (btn) btn.disabled = true;
+          try {
+            this.log(`${action}…`);
+            const res = await fetch("/api/camera/control", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                mac: this.camera.mac,
+                productModel: this.camera.productModel,
+                action,
+              }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+            this.log(`${action} ok`, "ok");
+            return true;
+          } catch (err) {
+            this.log(`${action} failed: ${err.message}`, "err");
+            return false;
+          } finally {
+            if (btn) btn.disabled = false;
+          }
+        }
+
         _connect(signalingUrl, iceServers, sessionToken) {
           this.log("Connecting…");
           this.pc = new RTCPeerConnection({ iceServers });
 
           this.pc.ontrack = (event) => {
             if (sessionToken !== this.sessionToken) return;
-            this.log("Streaming", "ok");
-            this.els.video.srcObject = event.streams[0];
-            this.setOverlay(null);
-            this.setBadge("● Live", "badge-streaming");
-            this._resolveStartWaiters(true);
+            this.log(`Track arrived: ${event.track.kind}`, "ok");
+            if (!this.remoteStream) this.remoteStream = new MediaStream();
+            this.remoteStream.addTrack(event.track);
+            this.els.video.srcObject = this.remoteStream;
+            this.els.video.muted = this.muted;
+            if (event.track.kind === "video") {
+              this.setOverlay(null);
+              this.setBadge("● Live", "badge-streaming");
+              this._resolveStartWaiters(true);
+            }
           };
 
           this.pc.onicecandidate = (event) => {
@@ -405,6 +531,18 @@
           };
 
           this.pc.addTransceiver("video", { direction: "recvonly" });
+
+          // The Wyze camera's SDP answer expects bidirectional audio: a
+          // recvonly audio m-line makes it answer "send", which the browser
+          // rejects ("incompatible send direction"). So only add audio when
+          // talk is on, as sendrecv with the live mic track. That same session
+          // also carries the camera's audio back, so unmuting lets you hear it.
+          const micTrack = this.wantTalk && this.localStream
+            ? this.localStream.getAudioTracks()[0]
+            : null;
+          if (micTrack) {
+            this.pc.addTransceiver(micTrack, { direction: "sendrecv" });
+          }
 
           this.ws = new WebSocket(signalingUrl);
 
@@ -515,6 +653,11 @@
             this.pc.close();
             this.pc = null;
           }
+          if (this.localStream) {
+            this.localStream.getTracks().forEach((t) => t.stop());
+            this.localStream = null;
+          }
+          this.remoteStream = null;
           this.els.video.srcObject = null;
           this.setBadge(
             this.camera.online ? "Online" : "Offline",
@@ -526,6 +669,64 @@
         }
       }
 
+      let draggedTile = null;
+
+      function saveOrder() {
+        const order = [...grid.children].map((t) => t.dataset.mac);
+        try {
+          localStorage.setItem("wyzeTileOrder", JSON.stringify(order));
+        } catch (_) {}
+      }
+
+      function applySavedOrder() {
+        let order = [];
+        try {
+          order = JSON.parse(localStorage.getItem("wyzeTileOrder") || "[]");
+        } catch (_) {}
+        for (const mac of order) {
+          const tile = grid.querySelector(`.cam-tile[data-mac="${CSS.escape(mac)}"]`);
+          if (tile) grid.appendChild(tile);
+        }
+      }
+
+      function attachDragHandlers(tile) {
+        tile.addEventListener("dragstart", (e) => {
+          // Don't start a drag from a button — let clicks work normally.
+          if (e.target.closest("button")) {
+            e.preventDefault();
+            return;
+          }
+          draggedTile = tile;
+          tile.classList.add("dragging");
+          e.dataTransfer.effectAllowed = "move";
+          try {
+            e.dataTransfer.setData("text/plain", tile.dataset.mac);
+          } catch (_) {}
+        });
+
+        tile.addEventListener("dragend", () => {
+          tile.classList.remove("dragging");
+          grid.querySelectorAll(".drop-target").forEach((t) => t.classList.remove("drop-target"));
+          draggedTile = null;
+          saveOrder();
+        });
+
+        tile.addEventListener("dragover", (e) => {
+          if (!draggedTile || draggedTile === tile) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+          const rect = tile.getBoundingClientRect();
+          const after = e.clientX - rect.left > rect.width / 2;
+          if (after) tile.after(draggedTile);
+          else tile.before(draggedTile);
+        });
+
+        tile.addEventListener("dragenter", () => {
+          if (draggedTile && draggedTile !== tile) tile.classList.add("drop-target");
+        });
+        tile.addEventListener("dragleave", () => tile.classList.remove("drop-target"));
+      }
+
       function buildGrid(cameraList) {
         streams.forEach((s) => s.stop());
         streams.clear();
@@ -534,12 +735,16 @@
         for (const camera of cameraList) {
           const tile = document.createElement("div");
           tile.className = "cam-tile";
+          tile.draggable = true;
+          tile.dataset.mac = camera.mac;
           tile.innerHTML = `
             <div class="cam-tile-header">
+              <span class="drag-handle" title="Drag to reorder">⠿</span>
               <span class="cam-name">${escHtml(camera.nickname)}</span>
               <span class="cam-badge ${camera.online ? "badge-online" : "badge-offline"}">
                 ${camera.online ? "Online" : "Offline"}
               </span>
+              <button class="expand-btn" title="Expand / collapse">⛶</button>
             </div>
             <div class="cam-video-wrap">
               ${
@@ -551,12 +756,27 @@
               <div class="cam-overlay">${camera.online ? "Click Start" : "Camera offline"}</div>
             </div>
             <div class="cam-log"></div>
-            <div class="cam-footer">
+            <div class="cam-controls">
               <button class="start-btn" ${camera.online ? "" : "disabled"}>▶ Start</button>
               <button class="snapshot-btn">📸 Snapshot</button>
               <button class="stop-btn">■ Stop</button>
-              <span style="flex:1"></span>
-              <span style="font-size:0.72rem;color:#475569">${escHtml(camera.productModel)}</span>
+              <span class="ctrl-sep"></span>
+              <button class="mute-btn">🔇 Muted</button>
+              <button class="talk-btn" title="Experimental — camera may reject mic audio">🎙 Talk</button>
+              <span class="ctrl-sep"></span>
+              <button class="toggle-btn" data-on="floodlight_on" data-off="floodlight_off"
+                data-label-on="💡 Flood Off" data-label-off="💡 Flood">💡 Flood</button>
+              <button class="toggle-btn" data-on="spotlight_on" data-off="spotlight_off"
+                data-label-on="🔦 Spot Off" data-label-off="🔦 Spot">🔦 Spot</button>
+              <button class="toggle-btn" data-on="siren_on" data-off="siren_off"
+                data-label-on="🚨 Siren Off" data-label-off="🚨 Siren">🚨 Siren</button>
+              <span class="ctrl-sep"></span>
+              <button class="toggle-btn" data-on="motion_on" data-off="motion_off"
+                data-label-on="🏃 Motion Off" data-label-off="🏃 Motion">🏃 Motion</button>
+              <button class="toggle-btn" data-on="recording_on" data-off="recording_off"
+                data-label-on="⏺ Rec Off" data-label-off="⏺ Rec">⏺ Rec</button>
+              <button class="toggle-btn" data-on="notifications_on" data-off="notifications_off"
+                data-label-on="🔔 Notify Off" data-label-off="🔔 Notify">🔔 Notify</button>
             </div>`;
 
           grid.appendChild(tile);
@@ -570,6 +790,8 @@
             startBtn: tile.querySelector(".start-btn"),
             snapshotBtn: tile.querySelector(".snapshot-btn"),
             stopBtn: tile.querySelector(".stop-btn"),
+            muteBtn: tile.querySelector(".mute-btn"),
+            talkBtn: tile.querySelector(".talk-btn"),
           };
 
           const session = new StreamSession(camera, els);
@@ -578,7 +800,35 @@
           els.startBtn.addEventListener("click", () => session.start());
           els.snapshotBtn.addEventListener("click", () => session.refreshSnapshot());
           els.stopBtn.addEventListener("click", () => session.stop());
+          els.muteBtn.addEventListener("click", () => session.toggleMute());
+          els.talkBtn.addEventListener("click", () => session.toggleTalk());
+
+          tile.querySelector(".expand-btn").addEventListener("click", () => {
+            const expanding = !tile.classList.contains("expanded");
+            tile.classList.toggle("expanded", expanding);
+            if (expanding) {
+              grid.prepend(tile);
+              tile.scrollIntoView({ behavior: "smooth", block: "start" });
+            }
+          });
+
+          attachDragHandlers(tile);
+
+          for (const btn of tile.querySelectorAll(".toggle-btn")) {
+            btn.dataset.state = "off";
+            btn.addEventListener("click", async () => {
+              const turningOn = btn.dataset.state === "off";
+              const action = turningOn ? btn.dataset.on : btn.dataset.off;
+              const ok = await session.control(action, btn);
+              if (!ok) return;
+              btn.dataset.state = turningOn ? "on" : "off";
+              btn.classList.toggle("on", turningOn);
+              btn.textContent = turningOn ? btn.dataset.labelOn : btn.dataset.labelOff;
+            });
+          }
         }
+
+        applySavedOrder();
       }
 
       async function loadCameras() {

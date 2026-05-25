@@ -1,7 +1,75 @@
-# wyze-api
+# wyze-cams
+
+> **This project is a fork of [jfarmer08/wyze-api](https://github.com/jfarmer08/wyze-api).**
+> It keeps the underlying library and adds **cam-frontend** — a browser dashboard for live
+> camera feeds and device control — plus Docker packaging to run it as a container.
+
+[![Chat](https://img.shields.io/discord/1134601590762913863)](https://discord.gg/Mjkpq2x9)
+
+## Camera Dashboard (cam-frontend)
+
+`cam-frontend/` is a self-contained web app that streams your Wyze cameras over WebRTC and
+exposes per-camera controls (siren, motion/recording, notifications, flood/spotlight on
+supported models, plus experimental two-way talk). It runs on top of the library in `src/`.
+
+### Run locally
+
+```bash
+# 1. Install the library dependencies (repo root)
+npm install
+
+# 2. Install the frontend's dependency and add your credentials
+cd cam-frontend
+npm install
+cp .env.example .env        # then edit .env with your Wyze credentials
+
+# 3. Start the dashboard
+node server.js              # http://localhost:3030
+```
+
+`KEY_ID` and `API_KEY` come from the Wyze developer portal
+(<https://developer-api-console.wyze.com/> → API Key Management) — your account password
+alone is not enough to authenticate.
+
+### Run with Docker
+
+A `Dockerfile`, `.dockerignore`, and `docker-compose.yml` live at the repo root. The image
+bundles the library source, the frontend, and a static ffmpeg (via `ffmpeg-static`) — no
+system ffmpeg needed.
+
+**Using docker compose (recommended):**
+
+```bash
+# Put your credentials in cam-frontend/.env first (cp from .env.example)
+docker compose up -d --build          # build + run in the background
+docker compose logs -f                # follow logs
+docker compose down                   # stop and remove the container
+```
+
+Open <http://localhost:3030>. Login tokens are stored in the named `wyze-tokens` volume,
+so the container won't re-authenticate on every restart.
+
+**Using plain docker:**
+
+```bash
+docker build -t wyze-cams .
+
+docker run -d --name wyze-cams \
+  -p 3030:3030 \
+  --env-file cam-frontend/.env \
+  -e PERSIST_PATH=/data \
+  -v wyze-tokens:/data \
+  wyze-cams
+```
+
+To change the published port, map it explicitly, e.g. `-p 8080:3030`.
+
+---
+
+## Library (wyze-api)
+
 [![npm](https://img.shields.io/npm/dt/wyze-api)](https://www.npmjs.com/package/wyze-api)
 [![npm](https://img.shields.io/npm/v/wyze-api.svg?style=flat-square)](https://www.npmjs.com/package/wyze-api)
-[![Chat](https://img.shields.io/discord/1134601590762913863)](https://discord.gg/Mjkpq2x9)
 [![GitHub last commit](https://img.shields.io/github/last-commit/jfarmer08/wyze-api)](https://github.com/jfarmer08/wyze-api)
 
 
