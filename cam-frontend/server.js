@@ -43,16 +43,6 @@ const wyze = new WyzeAPI({
 const port = Number(process.env.VIEWER_PORT || 3030);
 const viewerHtmlPath = path.join(__dirname, "public", "viewer.html");
 
-// docker-wyze-bridge sidecar. Some controls (e.g. the Wyze Cam v4 / HL_CAM4
-// spotlight) cannot be performed over the cloud API — the camera only accepts
-// them over its live TUTK connection. The bridge maintains that connection and
-// exposes a REST control API, so those actions are proxied to it.
-const bridgeUrl = (process.env.BRIDGE_URL || "http://localhost:5000").replace(/\/+$/, "");
-const bridgeApiKey = process.env.BRIDGE_API || "";
-const bridgeUriSeparator = ["-", "_", "#"].includes(process.env.URI_SEPARATOR)
-  ? process.env.URI_SEPARATOR
-  : "-";
-
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(payload));
@@ -82,46 +72,6 @@ function readJsonBody(req) {
   });
 }
 
-// Derive the bridge's camera URI from a nickname, matching docker-wyze-bridge's
-// clean_name(): spaces -> separator, drop chars outside [-\w+], lowercased.
-function bridgeCamName(nickname, mac) {
-  return (nickname || mac || "")
-    .trim()
-    .replace(/ /g, bridgeUriSeparator)
-    .replace(/[^-\w+]/g, "")
-    .toLowerCase();
-}
-
-// GET {BRIDGE_URL}/api/{cam}/{command}/{payload}?api={key}
-function bridgeControl(camName, command, payload) {
-  return new Promise((resolve, reject) => {
-    const query = bridgeApiKey ? `?api=${encodeURIComponent(bridgeApiKey)}` : "";
-    const url = `${bridgeUrl}/api/${encodeURIComponent(camName)}/${command}/${payload}${query}`;
-    const client = url.startsWith("https") ? https : http;
-    const request = client.get(url, (upstream) => {
-      let body = "";
-      upstream.on("data", (chunk) => (body += chunk));
-      upstream.on("end", () => {
-        let parsed;
-        try {
-          parsed = JSON.parse(body);
-        } catch {
-          parsed = body;
-        }
-        if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
-          reject(new Error(`bridge HTTP ${upstream.statusCode}: ${String(body).slice(0, 200)}`));
-        } else if (parsed && parsed.status === "error") {
-          reject(new Error(parsed.response || "bridge reported error"));
-        } else {
-          resolve(parsed);
-        }
-      });
-    });
-    request.on("error", reject);
-    request.setTimeout(10_000, () => request.destroy(new Error("bridge request timed out")));
-  });
-}
-
 // Maps a control action to the wyze-api method that performs it; each takes
 // (mac, model). Cameras silently no-op on unsupported features (e.g. a
 // floodlight call to a camera without one), so the client surfaces any thrown
@@ -141,13 +91,11 @@ const CAMERA_ACTIONS = {
   power_off: "cameraTurnOff",
 };
 
-// Actions the cloud API can't perform on newer cameras (e.g. the v4 spotlight,
-// which silently no-ops on set_property P1056). These are sent over the camera's
-// live connection via the docker-wyze-bridge sidecar instead.
-const BRIDGE_ACTIONS = {
-  spotlight_on: { command: "spotlight", payload: "on" },
-  spotlight_off: { command: "spotlight", payload: "off" },
-};
+// The Wyze Cam v4 (HL_CAM4) spotlight can ONLY be toggled over the camera's
+// live TUTK connection — every cloud method (set_property P1056, sirius,
+// devicemgmt run_action) is a no-op. The dashboard disables the Spot button for
+// these models; this guard returns a clear message if it's requested anyway.
+const APP_ONLY_ACTIONS = new Set(["spotlight_on", "spotlight_off"]);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -299,21 +247,12 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: "Missing mac, productModel, or action" });
         return;
       }
-      const bridgeAction = BRIDGE_ACTIONS[action];
-      if (bridgeAction) {
-        await wyze.maybeLogin();
-        const camera = await wyze.getCamera(mac);
-        const camName = bridgeCamName(camera?.nickname, mac);
-        try {
-          const result = await bridgeControl(
-            camName,
-            bridgeAction.command,
-            bridgeAction.payload
-          );
-          sendJson(res, 200, { ok: true, action, via: "bridge", camName, result });
-        } catch (error) {
-          sendJson(res, 502, { error: `${action} failed via bridge: ${error.message}` });
-        }
+      if (APP_ONLY_ACTIONS.has(action)) {
+        sendJson(res, 501, {
+          error:
+            "Spotlight can't be controlled over the web on this camera — use the Wyze app. " +
+            "The Wyze Cam v4 spotlight is only reachable over the camera's live connection.",
+        });
         return;
       }
 

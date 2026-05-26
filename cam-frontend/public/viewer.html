@@ -837,8 +837,13 @@
               <span class="ctrl-sep"></span>
               <button class="mute-btn">🔇 Muted</button>
               <span class="ctrl-sep"></span>
-              <button class="toggle-btn" data-on="spotlight_on" data-off="spotlight_off"
-                data-label-on="🔦 Spot Off" data-label-off="🔦 Spot">🔦 Spot</button>
+              ${
+                camera.productModel === "HL_CAM4"
+                  ? `<button class="toggle-btn" disabled
+                      title="The Wyze Cam v4 spotlight is only reachable over the camera's live connection — use the Wyze app. It can't be toggled through the cloud/web.">🔦 Spot (app only)</button>`
+                  : `<button class="toggle-btn" data-on="spotlight_on" data-off="spotlight_off"
+                      data-label-on="🔦 Spot Off" data-label-off="🔦 Spot">🔦 Spot</button>`
+              }
               <button class="toggle-btn" data-on="siren_on" data-off="siren_off"
                 data-label-on="🚨 Siren Off" data-label-off="🚨 Siren">🚨 Siren</button>
               <span class="ctrl-sep"></span>
