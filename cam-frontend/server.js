@@ -11,6 +11,7 @@
  *   GET /api/stream-params?mac=&productModel=&substream=&clientId=
  *                                      — { params: { signalingUrl, iceServers, clientId? }, cached }
  *   GET /api/snapshot?mac=             — { available, snapshot? }
+ *   GET /api/events?since=&mac=        — { events: [...] } recent motion/person events
  *   GET /api/thumbnail?url=            — proxies a thumbnail image (CORS workaround)
  *   POST /api/camera/control           — { mac, productModel, action } toggles
  *                                        floodlight/spotlight/siren/motion/recording/notifications/power
@@ -42,6 +43,16 @@ const wyze = new WyzeAPI({
 const port = Number(process.env.VIEWER_PORT || 3030);
 const viewerHtmlPath = path.join(__dirname, "public", "viewer.html");
 
+// docker-wyze-bridge sidecar. Some controls (e.g. the Wyze Cam v4 / HL_CAM4
+// spotlight) cannot be performed over the cloud API — the camera only accepts
+// them over its live TUTK connection. The bridge maintains that connection and
+// exposes a REST control API, so those actions are proxied to it.
+const bridgeUrl = (process.env.BRIDGE_URL || "http://localhost:5000").replace(/\/+$/, "");
+const bridgeApiKey = process.env.BRIDGE_API || "";
+const bridgeUriSeparator = ["-", "_", "#"].includes(process.env.URI_SEPARATOR)
+  ? process.env.URI_SEPARATOR
+  : "-";
+
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(payload));
@@ -71,6 +82,46 @@ function readJsonBody(req) {
   });
 }
 
+// Derive the bridge's camera URI from a nickname, matching docker-wyze-bridge's
+// clean_name(): spaces -> separator, drop chars outside [-\w+], lowercased.
+function bridgeCamName(nickname, mac) {
+  return (nickname || mac || "")
+    .trim()
+    .replace(/ /g, bridgeUriSeparator)
+    .replace(/[^-\w+]/g, "")
+    .toLowerCase();
+}
+
+// GET {BRIDGE_URL}/api/{cam}/{command}/{payload}?api={key}
+function bridgeControl(camName, command, payload) {
+  return new Promise((resolve, reject) => {
+    const query = bridgeApiKey ? `?api=${encodeURIComponent(bridgeApiKey)}` : "";
+    const url = `${bridgeUrl}/api/${encodeURIComponent(camName)}/${command}/${payload}${query}`;
+    const client = url.startsWith("https") ? https : http;
+    const request = client.get(url, (upstream) => {
+      let body = "";
+      upstream.on("data", (chunk) => (body += chunk));
+      upstream.on("end", () => {
+        let parsed;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          parsed = body;
+        }
+        if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
+          reject(new Error(`bridge HTTP ${upstream.statusCode}: ${String(body).slice(0, 200)}`));
+        } else if (parsed && parsed.status === "error") {
+          reject(new Error(parsed.response || "bridge reported error"));
+        } else {
+          resolve(parsed);
+        }
+      });
+    });
+    request.on("error", reject);
+    request.setTimeout(10_000, () => request.destroy(new Error("bridge request timed out")));
+  });
+}
+
 // Maps a control action to the wyze-api method that performs it; each takes
 // (mac, model). Cameras silently no-op on unsupported features (e.g. a
 // floodlight call to a camera without one), so the client surfaces any thrown
@@ -78,8 +129,6 @@ function readJsonBody(req) {
 const CAMERA_ACTIONS = {
   floodlight_on: "cameraFloodLightOn",
   floodlight_off: "cameraFloodLightOff",
-  spotlight_on: "cameraSpotLightOn",
-  spotlight_off: "cameraSpotLightOff",
   siren_on: "cameraSirenOn",
   siren_off: "cameraSirenOff",
   motion_on: "cameraMotionOn",
@@ -90,6 +139,14 @@ const CAMERA_ACTIONS = {
   notifications_off: "cameraNotificationsOff",
   power_on: "cameraTurnOn",
   power_off: "cameraTurnOff",
+};
+
+// Actions the cloud API can't perform on newer cameras (e.g. the v4 spotlight,
+// which silently no-ops on set_property P1056). These are sent over the camera's
+// live connection via the docker-wyze-bridge sidecar instead.
+const BRIDGE_ACTIONS = {
+  spotlight_on: { command: "spotlight", payload: "on" },
+  spotlight_off: { command: "spotlight", payload: "off" },
 };
 
 const server = http.createServer(async (req, res) => {
@@ -169,6 +226,57 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Recent camera events (motion/person/sound). The browser polls this to
+    // raise notifications locally, since Wyze cloud push only reaches the phone
+    // app. `since` (epoch ms) returns only events newer than that timestamp.
+    if (req.method === "GET" && requestUrl.pathname === "/api/events") {
+      await wyze.maybeLogin();
+      const sinceParam = requestUrl.searchParams.get("since");
+      const macParam = requestUrl.searchParams.get("mac");
+      const since = sinceParam ? Number(sinceParam) : Date.now() - 60 * 60 * 1000;
+
+      const events = await wyze.getEventList({
+        beginTime: since,
+        count: 50,
+        deviceMacList: macParam ? [macParam] : [],
+      });
+
+      let names = {};
+      try {
+        const cams = await wyze.getCameras();
+        names = Object.fromEntries(cams.map((c) => [c.mac, c.nickname]));
+      } catch {
+        /* names are best-effort; fall back to MAC */
+      }
+
+      const normalized = events
+        .map((e) => {
+          const files = e.file_list || [];
+          const image = files.find((f) => f.type === 1) || files[0];
+          const video = files.find((f) => f.type === 2);
+          const tags = (e.tag_list || [])
+            .map((t) => t.name || t.tag_id)
+            .filter(Boolean);
+          return {
+            id: e.event_id,
+            mac: e.device_mac,
+            model: e.device_model,
+            nickname: names[e.device_mac] || e.device_mac,
+            time: Number(e.event_ts),
+            value: String(e.event_value ?? ""),
+            category: e.event_category,
+            tags,
+            thumbnail: image?.url || null,
+            video: video?.url || null,
+          };
+        })
+        .filter((e) => e.time > since)
+        .sort((a, b) => b.time - a.time);
+
+      sendJson(res, 200, { events: normalized });
+      return;
+    }
+
     if (req.method === "GET" && requestUrl.pathname === "/api/health") {
       sendJson(res, 200, { ok: true });
       return;
@@ -191,6 +299,24 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { error: "Missing mac, productModel, or action" });
         return;
       }
+      const bridgeAction = BRIDGE_ACTIONS[action];
+      if (bridgeAction) {
+        await wyze.maybeLogin();
+        const camera = await wyze.getCamera(mac);
+        const camName = bridgeCamName(camera?.nickname, mac);
+        try {
+          const result = await bridgeControl(
+            camName,
+            bridgeAction.command,
+            bridgeAction.payload
+          );
+          sendJson(res, 200, { ok: true, action, via: "bridge", camName, result });
+        } catch (error) {
+          sendJson(res, 502, { error: `${action} failed via bridge: ${error.message}` });
+        }
+        return;
+      }
+
       const method = CAMERA_ACTIONS[action];
       if (!method) {
         sendJson(res, 400, { error: `Unknown action: ${action}` });

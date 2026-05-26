@@ -2601,6 +2601,37 @@ module.exports = class WyzeAPI {
   }
 
   /**
+   * Fetch recent device events (motion, person, sound, etc.) from the Wyze
+   * cloud. These are the same events that trigger the phone app's push
+   * notifications; cloud push only targets the mobile app, so the browser
+   * dashboard polls this to surface notifications client-side.
+   *
+   * @param {Object} [options]
+   * @param {string[]} [options.deviceMacList] — limit to these MACs (default: all)
+   * @param {number} [options.beginTime] — window start, epoch ms (default: 1h ago)
+   * @param {number} [options.endTime] — window end, epoch ms (default: now + 1min)
+   * @param {number} [options.count=20] — max events, newest first
+   * @param {string[]} [options.eventValueList] — alarm-type filter (default: all)
+   * @returns {Promise<Array>} event objects (event_id, device_mac, event_ts,
+   *   event_value, event_category, file_list, tag_list, …)
+   */
+  async getEventList(options = {}) {
+    const now = Date.now();
+    const data = {
+      count: options.count || 20,
+      order_by: 2, // newest first
+      begin_time: options.beginTime || now - 60 * 60 * 1000,
+      end_time: options.endTime || now + 60 * 1000,
+      device_mac_list: options.deviceMacList || [],
+      event_type: "",
+      event_value_list: options.eventValueList || [],
+      event_tag_list: [],
+    };
+    const result = await this.request("app/v2/device/get_event_list", data);
+    return result.data.data?.event_list || [];
+  }
+
+  /**
    * Capture a single JPEG frame by negotiating a headless WebRTC session
    * with the camera. Requires `ffmpeg` on the system PATH.
    *

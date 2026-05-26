@@ -255,6 +255,55 @@
       .log-err {
         color: #fca5a5;
       }
+      #toasts {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        z-index: 1000;
+        max-width: 320px;
+      }
+      .toast {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-left: 4px solid #38bdf8;
+        border-radius: 8px;
+        padding: 10px 12px;
+        color: #e2e8f0;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+        cursor: pointer;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        animation: toastIn 0.18s ease-out;
+      }
+      .toast img {
+        width: 56px;
+        height: 40px;
+        object-fit: cover;
+        border-radius: 4px;
+        flex: none;
+      }
+      .toast .toast-title {
+        font-weight: 600;
+        font-size: 0.85rem;
+      }
+      .toast .toast-sub {
+        font-size: 0.72rem;
+        color: #94a3b8;
+      }
+      @keyframes toastIn {
+        from {
+          opacity: 0;
+          transform: translateX(20px);
+        }
+        to {
+          opacity: 1;
+          transform: translateX(0);
+        }
+      }
     </style>
   </head>
   <body>
@@ -266,10 +315,12 @@
         <button id="startAllBtn">▶ Start All</button>
         <button id="stopAllBtn" class="danger">■ Stop All</button>
         <button id="substreamBtn">Sub-stream: OFF</button>
+        <button id="alertsBtn">🔔 Browser Alerts: OFF</button>
       </div>
     </header>
     <div id="statusBar">Loading cameras…</div>
     <div id="grid"></div>
+    <div id="toasts"></div>
 
     <script>
       let cameras = [];
@@ -283,6 +334,8 @@
       const startAllBtn = document.getElementById("startAllBtn");
       const stopAllBtn = document.getElementById("stopAllBtn");
       const substreamBtn = document.getElementById("substreamBtn");
+      const alertsBtn = document.getElementById("alertsBtn");
+      const toasts = document.getElementById("toasts");
 
       substreamBtn.addEventListener("click", () => {
         useSubstream = !useSubstream;
@@ -333,6 +386,24 @@
           this.localStream = null;
           this.remoteStream = null;
           this.muted = true;
+          this.silentCtx = null;
+        }
+
+        // A muted, generated audio track so we can offer sendrecv audio without
+        // asking for mic permission. The camera will only stream its audio back
+        // on a session that also carries an audio m-line, so listen-only needs
+        // *some* outgoing track here.
+        _createSilentAudioTrack() {
+          const AudioCtx = window.AudioContext || window.webkitAudioContext;
+          const ctx = new AudioCtx();
+          this.silentCtx = ctx;
+          const oscillator = ctx.createOscillator();
+          const dst = ctx.createMediaStreamDestination();
+          oscillator.connect(dst);
+          oscillator.start();
+          const track = dst.stream.getAudioTracks()[0];
+          track.enabled = false;
+          return track;
         }
 
         log(msg, level = "") {
@@ -534,15 +605,15 @@
 
           // The Wyze camera's SDP answer expects bidirectional audio: a
           // recvonly audio m-line makes it answer "send", which the browser
-          // rejects ("incompatible send direction"). So only add audio when
-          // talk is on, as sendrecv with the live mic track. That same session
-          // also carries the camera's audio back, so unmuting lets you hear it.
+          // rejects ("incompatible send direction"). So always negotiate
+          // sendrecv audio — with the live mic when talk is on, otherwise a
+          // muted silent track. The camera streams its audio back on that same
+          // m-line, so unmuting lets you hear it without needing mic access.
           const micTrack = this.wantTalk && this.localStream
             ? this.localStream.getAudioTracks()[0]
             : null;
-          if (micTrack) {
-            this.pc.addTransceiver(micTrack, { direction: "sendrecv" });
-          }
+          const audioTrack = micTrack || this._createSilentAudioTrack();
+          this.pc.addTransceiver(audioTrack, { direction: "sendrecv" });
 
           this.ws = new WebSocket(signalingUrl);
 
@@ -657,6 +728,10 @@
             this.localStream.getTracks().forEach((t) => t.stop());
             this.localStream = null;
           }
+          if (this.silentCtx) {
+            this.silentCtx.close().catch(() => {});
+            this.silentCtx = null;
+          }
           this.remoteStream = null;
           this.els.video.srcObject = null;
           this.setBadge(
@@ -758,23 +833,15 @@
             <div class="cam-log"></div>
             <div class="cam-controls">
               <button class="start-btn" ${camera.online ? "" : "disabled"}>▶ Start</button>
-              <button class="snapshot-btn">📸 Snapshot</button>
               <button class="stop-btn">■ Stop</button>
               <span class="ctrl-sep"></span>
               <button class="mute-btn">🔇 Muted</button>
-              <button class="talk-btn" title="Experimental — camera may reject mic audio">🎙 Talk</button>
               <span class="ctrl-sep"></span>
-              <button class="toggle-btn" data-on="floodlight_on" data-off="floodlight_off"
-                data-label-on="💡 Flood Off" data-label-off="💡 Flood">💡 Flood</button>
               <button class="toggle-btn" data-on="spotlight_on" data-off="spotlight_off"
                 data-label-on="🔦 Spot Off" data-label-off="🔦 Spot">🔦 Spot</button>
               <button class="toggle-btn" data-on="siren_on" data-off="siren_off"
                 data-label-on="🚨 Siren Off" data-label-off="🚨 Siren">🚨 Siren</button>
               <span class="ctrl-sep"></span>
-              <button class="toggle-btn" data-on="motion_on" data-off="motion_off"
-                data-label-on="🏃 Motion Off" data-label-off="🏃 Motion">🏃 Motion</button>
-              <button class="toggle-btn" data-on="recording_on" data-off="recording_off"
-                data-label-on="⏺ Rec Off" data-label-off="⏺ Rec">⏺ Rec</button>
               <button class="toggle-btn" data-on="notifications_on" data-off="notifications_off"
                 data-label-on="🔔 Notify Off" data-label-off="🔔 Notify">🔔 Notify</button>
             </div>`;
@@ -788,20 +855,16 @@
             badge: tile.querySelector(".cam-badge"),
             logEl: tile.querySelector(".cam-log"),
             startBtn: tile.querySelector(".start-btn"),
-            snapshotBtn: tile.querySelector(".snapshot-btn"),
             stopBtn: tile.querySelector(".stop-btn"),
             muteBtn: tile.querySelector(".mute-btn"),
-            talkBtn: tile.querySelector(".talk-btn"),
           };
 
           const session = new StreamSession(camera, els);
           streams.set(camera.mac, session);
 
           els.startBtn.addEventListener("click", () => session.start());
-          els.snapshotBtn.addEventListener("click", () => session.refreshSnapshot());
           els.stopBtn.addEventListener("click", () => session.stop());
           els.muteBtn.addEventListener("click", () => session.toggleMute());
-          els.talkBtn.addEventListener("click", () => session.toggleTalk());
 
           tile.querySelector(".expand-btn").addEventListener("click", () => {
             const expanding = !tile.classList.contains("expanded");
@@ -868,9 +931,161 @@
 
       stopAllBtn.addEventListener("click", () => streams.forEach((s) => s.stop()));
 
+      // --- Event notifications -------------------------------------------
+      // Wyze cloud push only reaches the phone app, so to get alerts in the
+      // browser we poll /api/events and raise notifications + toasts locally.
+      let alertsOn = false;
+      let eventsSince = Date.now();
+      let eventPollTimer = null;
+      const seenEvents = new Set();
+      const EVENT_POLL_MS = 10000;
+      const EVENT_LABELS = {
+        1: "Motion",
+        2: "Sound",
+        10: "Person",
+        12: "Vehicle",
+        13: "Person",
+        15: "Pet",
+      };
+
+      function eventLabel(ev) {
+        if (ev.tags && ev.tags.length) return ev.tags.join(", ");
+        return EVENT_LABELS[ev.value] || "Motion";
+      }
+
+      function thumbProxy(url) {
+        return url ? `/api/thumbnail?url=${encodeURIComponent(url)}` : null;
+      }
+
+      function focusCamera(mac) {
+        const tile = grid.querySelector(`[data-mac="${mac}"]`);
+        if (tile) tile.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+
+      function showToast(title, sub, ev) {
+        const toast = document.createElement("div");
+        toast.className = "toast";
+        const thumb = thumbProxy(ev.thumbnail);
+        toast.innerHTML = `
+          ${thumb ? `<img src="${thumb}" alt="" />` : ""}
+          <div>
+            <div class="toast-title">${escHtml(title)}</div>
+            <div class="toast-sub">${escHtml(sub)}</div>
+          </div>`;
+        toast.addEventListener("click", () => {
+          focusCamera(ev.mac);
+          toast.remove();
+        });
+        toasts.appendChild(toast);
+        setTimeout(() => toast.remove(), 8000);
+      }
+
+      function handleEvent(ev) {
+        const label = eventLabel(ev);
+        const when = new Date(ev.time).toLocaleTimeString();
+        const title = `${label} — ${ev.nickname}`;
+
+        if ("Notification" in window && Notification.permission === "granted") {
+          const n = new Notification(title, {
+            body: when,
+            icon: thumbProxy(ev.thumbnail) || undefined,
+            tag: ev.id,
+          });
+          n.onclick = () => {
+            window.focus();
+            focusCamera(ev.mac);
+            n.close();
+          };
+        }
+
+        const session = streams.get(ev.mac);
+        if (session) session.log(`🔔 ${label} @ ${when}`, "");
+
+        showToast(title, when, ev);
+      }
+
+      async function pollEvents() {
+        try {
+          const res = await fetch(`/api/events?since=${eventsSince}`);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "events fetch failed");
+          const events = (data.events || []).sort((a, b) => a.time - b.time);
+          for (const ev of events) {
+            if (seenEvents.has(ev.id)) continue;
+            seenEvents.add(ev.id);
+            if (ev.time > eventsSince) eventsSince = ev.time;
+            handleEvent(ev);
+          }
+        } catch (err) {
+          statusBar.textContent = "Events error: " + err.message;
+        }
+      }
+
+      // Per-browser preference. Defaults to ON: alerts run unless the user has
+      // explicitly turned them off in this browser.
+      const ALERTS_PREF_KEY = "wyzeBrowserAlerts";
+      function alertsEnabledPref() {
+        try {
+          return localStorage.getItem(ALERTS_PREF_KEY) !== "off";
+        } catch {
+          return true;
+        }
+      }
+      function setAlertsPref(on) {
+        try {
+          localStorage.setItem(ALERTS_PREF_KEY, on ? "on" : "off");
+        } catch {
+          /* ignore unavailable storage */
+        }
+      }
+
+      function startAlerts() {
+        if (alertsOn) return;
+        alertsOn = true;
+        eventsSince = Date.now();
+        alertsBtn.textContent = "🔔 Browser Alerts: ON";
+        alertsBtn.classList.add("active");
+        pollEvents();
+        eventPollTimer = setInterval(pollEvents, EVENT_POLL_MS);
+      }
+      function stopAlerts() {
+        alertsOn = false;
+        clearInterval(eventPollTimer);
+        eventPollTimer = null;
+        alertsBtn.textContent = "🔔 Browser Alerts: OFF";
+        alertsBtn.classList.remove("active");
+      }
+
+      alertsBtn.addEventListener("click", async () => {
+        if (alertsOn) {
+          setAlertsPref(false);
+          stopAlerts();
+          return;
+        }
+        setAlertsPref(true);
+        if ("Notification" in window && Notification.permission === "default") {
+          await Notification.requestPermission();
+        }
+        if ("Notification" in window && Notification.permission === "denied") {
+          statusBar.textContent =
+            "OS/browser notifications are blocked — showing in-page toasts only.";
+        }
+        startAlerts();
+      });
+
       loadCameras().catch((err) => {
         statusBar.textContent = "Error: " + err.message;
       });
+
+      // Default ON for each browser unless the user previously turned it off.
+      if (alertsEnabledPref()) {
+        // A permission prompt needs a user gesture, so we can't force the OS
+        // dialog on load; if already granted we use OS notifications, otherwise
+        // in-page toasts run until the user clicks the button to grant.
+        startAlerts();
+      } else {
+        stopAlerts();
+      }
     </script>
   </body>
 </html>
