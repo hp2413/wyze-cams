@@ -913,11 +913,11 @@
               <button class="stop-btn">■ Stop</button>
               <span class="ctrl-sep"></span>
               <button class="mute-btn">🔇 Muted</button>
+              <button class="snap-btn" title="Capture frame from live view">📸 Snap</button>
               <span class="ctrl-sep"></span>
               ${
                 camera.productModel === "HL_CAM4"
-                  ? `<button class="toggle-btn" disabled
-                      title="The Wyze Cam v4 spotlight is only reachable over the camera's live connection — use the Wyze app. It can't be toggled through the cloud/web.">🔦 Spot (app only)</button>`
+                  ? ""
                   : `<button class="toggle-btn" data-on="spotlight_on" data-off="spotlight_off"
                       data-label-on="🔦 Spot Off" data-label-off="🔦 Spot">🔦 Spot</button>`
               }
@@ -947,6 +947,7 @@
           els.startBtn.addEventListener("click", () => session.start());
           els.stopBtn.addEventListener("click", () => session.stop());
           els.muteBtn.addEventListener("click", () => session.toggleMute());
+          tile.querySelector(".snap-btn").addEventListener("click", () => captureFromVideo(session));
 
           tile.querySelector(".expand-btn").addEventListener("click", () => {
             const expanding = !tile.classList.contains("expanded");
@@ -1005,12 +1006,42 @@
         }
       });
 
+      function captureFromVideo(session) {
+        const video = session.els.video;
+        const name = session.camera.nickname || session.camera.name || "camera";
+        if (!video || !video.videoWidth || !video.videoHeight) {
+          session.log?.("No live frame — start the stream first", "warn");
+          return false;
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        try {
+          canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+        } catch (err) {
+          session.log?.(`Capture failed: ${err.message}`, "err");
+          return false;
+        }
+        canvas.toBlob((blob) => {
+          if (!blob) return;
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          const safe = String(name).replace(/[^a-z0-9_-]+/gi, "_");
+          a.download = `${safe}-${Date.now()}.png`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        }, "image/png");
+        session.log?.(`Snapshot saved (${canvas.width}×${canvas.height})`, "ok");
+        return true;
+      }
+
       snapshotAllBtn.addEventListener("click", () => {
         let delay = 0;
         for (const session of streams.values()) {
-          // Eufy sessions have no cloud snapshot — skip them.
-          if (typeof session.refreshSnapshot !== "function") continue;
-          setTimeout(() => session.refreshSnapshot(), delay);
+          setTimeout(() => captureFromVideo(session), delay);
           delay += 150;
         }
       });
@@ -1369,6 +1400,7 @@
               <button class="stop-btn">■ Stop</button>
               <span class="ctrl-sep"></span>
               <button class="mute-btn">🔇 Muted</button>
+              <button class="snap-btn" title="Capture frame from live view">📸 Snap</button>
             </div>`;
           grid.appendChild(tile);
 
@@ -1385,6 +1417,7 @@
           tile.querySelector(".start-btn").addEventListener("click", () => session.start());
           tile.querySelector(".stop-btn").addEventListener("click", () => session.stop());
           els.muteBtn.addEventListener("click", () => session.toggleMute());
+          tile.querySelector(".snap-btn").addEventListener("click", () => captureFromVideo(session));
           tile.querySelector(".expand-btn").addEventListener("click", () => {
             const expanding = !tile.classList.contains("expanded");
             tile.classList.toggle("expanded", expanding);
