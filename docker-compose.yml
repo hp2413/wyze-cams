@@ -5,12 +5,21 @@ services:
     container_name: wyze-cams
     ports:
       - "3030:3030"
-    # Your Wyze credentials live here (copy cam-frontend/.env.example).
+    # All credentials live in the shared root .env (copy from .env.example).
     env_file:
-      - cam-frontend/.env
-    # Override PERSIST_PATH from the env file so tokens land on the volume.
+      - .env
     environment:
+      # Override PERSIST_PATH from the env file so tokens land on the volume.
       - PERSIST_PATH=/data
+      # The Eufy backend can't run in Docker — its P2P (UDP hole-punching) needs
+      # to be on the real network, which a container's NAT'd bridge isn't. So run
+      # `node server.js` in eufy/ on the HOST and reach it here via the Docker
+      # host gateway. (Only the Wyze dashboard is containerized.)
+      - EUFY_BASE_URL=http://host.docker.internal:3040
+    extra_hosts:
+      # host.docker.internal resolves to the host on Docker Desktop automatically;
+      # this mapping makes it work on plain Linux Docker too.
+      - "host.docker.internal:host-gateway"
     volumes:
       - wyze-tokens:/data
     restart: unless-stopped

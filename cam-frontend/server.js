@@ -18,13 +18,25 @@
  *   GET /api/health                    — { ok: true }
  */
 
-require("dotenv").config();
+const path = require("path");
+
+// Single shared env at the repo root (../.env) drives both this dashboard and
+// the sibling Eufy viewer — credentials live in one place.
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const http = require("http");
 const fs = require("fs");
-const path = require("path");
 const { URL } = require("url");
 const https = require("https");
+const { WebSocketServer, WebSocket } = require("ws");
+
+// The Eufy cameras are served by a separate process (eufy/server.js) that does
+// the cloud login, P2P session, and FFmpeg transcode. We don't reimplement any
+// of that here — we just proxy its HTTP API and video WebSocket through this
+// origin so the dashboard shows Wyze and Eufy cameras together on one page
+// without the browser needing a second origin or CORS. That process must be
+// running (default http://localhost:3040).
+const eufyBaseUrl = new URL(process.env.EUFY_BASE_URL || "http://localhost:3040");
 
 // Use the local fork's source (../src) so the dashboard runs against this
 // repo's fixes rather than a separately published package.
@@ -72,6 +84,36 @@ function readJsonBody(req) {
   });
 }
 
+// Forward a request to the Eufy viewer process untouched and stream its
+// response straight back. Works for JSON routes and the SSE event stream alike
+// (we just pipe the upstream body). The request body, if any, is piped through
+// — so this must run before any handler that consumes `req`.
+function proxyToEufy(req, res, eufyPath) {
+  const upstream = http.request(
+    {
+      hostname: eufyBaseUrl.hostname,
+      port: eufyBaseUrl.port,
+      path: eufyPath,
+      method: req.method,
+      headers: { ...req.headers, host: eufyBaseUrl.host },
+    },
+    (up) => {
+      res.writeHead(up.statusCode, up.headers);
+      up.pipe(res);
+    }
+  );
+  upstream.on("error", (err) => {
+    if (!res.headersSent) {
+      sendJson(res, 502, {
+        error: `Eufy server unreachable at ${eufyBaseUrl.origin} — is eufy/server.js running? (${err.message})`,
+      });
+    } else {
+      res.end();
+    }
+  });
+  req.pipe(upstream);
+}
+
 // Maps a control action to the wyze-api method that performs it; each takes
 // (mac, model). Cameras silently no-op on unsupported features (e.g. a
 // floodlight call to a camera without one), so the client surfaces any thrown
@@ -103,6 +145,22 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && requestUrl.pathname === "/") {
       sendHtml(res, fs.readFileSync(viewerHtmlPath, "utf8"));
+      return;
+    }
+
+    // --- Eufy passthrough: proxied to eufy/server.js (see eufyBaseUrl) -------
+    // Mirrors that server's routes under /api/eufy/* so the dashboard can talk
+    // to a single origin. The /eufy-stream WebSocket is handled in the
+    // "upgrade" listener below, not here.
+    const EUFY_PROXY = {
+      "GET /api/eufy/cameras": "/api/cameras",
+      "GET /api/eufy/auth/status": "/api/auth/status",
+      "POST /api/eufy/auth/submit": "/api/auth/submit",
+      "GET /api/eufy/events": "/api/events",
+    };
+    const eufyTarget = EUFY_PROXY[`${req.method} ${requestUrl.pathname}`];
+    if (eufyTarget) {
+      proxyToEufy(req, res, eufyTarget);
       return;
     }
 
@@ -280,6 +338,57 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Proxy the Eufy video WebSocket (/eufy-stream?sn=) to eufy/server.js's
+// /stream endpoint, piping binary MPEG-TS frames both directions. The browser
+// only ever connects here, so it stays on a single origin.
+const eufyWss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  const requestUrl = new URL(req.url, `http://${req.headers.host}`);
+  if (requestUrl.pathname !== "/eufy-stream") {
+    socket.destroy();
+    return;
+  }
+  const sn = requestUrl.searchParams.get("sn");
+  if (!sn) {
+    socket.destroy();
+    return;
+  }
+  eufyWss.handleUpgrade(req, socket, head, (client) => {
+    const target = `ws://${eufyBaseUrl.host}/stream?sn=${encodeURIComponent(sn)}`;
+    const upstream = new WebSocket(target);
+    upstream.binaryType = "nodebuffer";
+
+    // Queue anything the browser sends before the upstream socket is open.
+    const pending = [];
+    upstream.on("open", () => {
+      for (const msg of pending) upstream.send(msg);
+      pending.length = 0;
+    });
+    upstream.on("message", (data) => {
+      if (client.readyState === WebSocket.OPEN) client.send(data);
+    });
+    upstream.on("close", () => {
+      try { client.close(); } catch (_) {}
+    });
+    upstream.on("error", () => {
+      try { client.close(); } catch (_) {}
+    });
+
+    client.on("message", (data) => {
+      if (upstream.readyState === WebSocket.OPEN) upstream.send(data);
+      else pending.push(data);
+    });
+    client.on("close", () => {
+      try { upstream.close(); } catch (_) {}
+    });
+    client.on("error", () => {
+      try { upstream.close(); } catch (_) {}
+    });
+  });
+});
+
 server.listen(port, () => {
   console.log(`Wyze viewer running: http://localhost:${port}`);
+  console.log(`Proxying Eufy cameras from ${eufyBaseUrl.origin}`);
 });

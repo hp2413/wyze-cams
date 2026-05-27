@@ -24,11 +24,14 @@
  *   WS   /stream?sn=<SN>    — binary MPEG-TS stream for one camera
  */
 
-require("dotenv").config();
+const path = require("path");
+
+// Single shared env at the repo root (../.env) drives both this viewer and the
+// sibling Wyze dashboard — credentials live in one place.
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const http = require("http");
 const fs = require("fs");
-const path = require("path");
 const { URL } = require("url");
 const { spawn } = require("child_process");
 const { WebSocketServer } = require("ws");
@@ -57,7 +60,7 @@ const config = {
   country: process.env.EUFY_COUNTRY || "US",
   language: process.env.EUFY_LANGUAGE || "en",
   persistentDir: path.resolve(process.env.EUFY_PERSIST_DIR || "./persist"),
-  p2pConnectionSetup: 0,
+  p2pConnectionSetup: Number(process.env.EUFY_P2P_SETUP ?? 0),
   pollingIntervalMinutes: 10,
   eventDurationSeconds: 10,
   // Auto-accept pending family/guest invitations so shared devices show up.
@@ -169,7 +172,7 @@ async function submitAuthCode(code) {
 
 async function initEufy() {
   if (!config.username || !config.password) {
-    throw new Error("Set EUFY_USERNAME and EUFY_PASSWORD in eufy/.env");
+    throw new Error("Set EUFY_USERNAME and EUFY_PASSWORD in the repo-root .env");
   }
   fs.mkdirSync(config.persistentDir, { recursive: true });
 

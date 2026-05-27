@@ -8,24 +8,41 @@
 
 ## Camera Dashboard (cam-frontend)
 
-`cam-frontend/` is a self-contained web app that streams your Wyze cameras over WebRTC and
-exposes per-camera controls (siren, motion/recording, notifications, flood/spotlight on
-supported models, plus experimental two-way talk). It runs on top of the library in `src/`.
+`cam-frontend/` is a self-contained web app that shows all your cameras on one page
+(<http://localhost:3030>):
+
+- **Wyze** cameras stream over WebRTC, with per-camera controls (siren, motion/recording,
+  notifications, flood/spotlight on supported models, plus experimental two-way talk). This
+  runs on top of the library in `src/`.
+- **Eufy** cameras stream from a separate backend process (`eufy/`) that logs into the Eufy
+  cloud, opens a P2P session, and transcodes to MPEG-TS with ffmpeg. The dashboard proxies
+  that backend (`/api/eufy/*` and the `/eufy-stream` WebSocket), so the browser only ever
+  talks to a single origin. Eufy tiles appear in the same grid, tagged with an **Eufy** chip.
+
+Both apps read a **single shared `.env` at the repo root** — credentials live in one place.
 
 ### Run locally
 
 ```bash
-# 1. Install the library dependencies (repo root)
+# 1. Install dependencies (repo root = library; each app has its own deps)
 npm install
+cd cam-frontend && npm install && cd ..
+cd eufy && npm install && cd ..
 
-# 2. Install the frontend's dependency and add your credentials
-cd cam-frontend
-npm install
-cp .env.example .env        # then edit .env with your Wyze credentials
+# 2. Add your credentials — one shared file at the repo root
+cp .env.example .env        # then edit .env with your Wyze (and Eufy) credentials
 
-# 3. Start the dashboard
-node server.js              # http://localhost:3030
+# 3a. Start the Eufy backend (skip if you have no Eufy cameras)
+cd eufy && node server.js          # backend on :3040 — keep this running
+
+# 3b. In a second terminal, start the dashboard
+cd cam-frontend && node server.js  # http://localhost:3030  ← open this
 ```
+
+The Eufy backend must stay running while you use the dashboard — it does the cloud login,
+P2P session, and ffmpeg transcode. The first Eufy login may need a captcha or 2FA code; the
+dashboard shows the challenge inline (no terminal interaction). If you only have Wyze
+cameras, skip step 3a — the Eufy tiles simply won't appear, and the dashboard still works.
 
 `KEY_ID` and `API_KEY` come from the Wyze developer portal
 (<https://developer-api-console.wyze.com/> → API Key Management) — your account password
@@ -37,16 +54,28 @@ A `Dockerfile`, `.dockerignore`, and `docker-compose.yml` live at the repo root.
 bundles the library source, the frontend, and a static ffmpeg (via `ffmpeg-static`) — no
 system ffmpeg needed.
 
+> **Note — Eufy is not containerized.** The Docker image serves the **Wyze** dashboard only.
+> Eufy streaming relies on P2P (UDP hole-punching) that needs to be on the real network — it
+> does **not** work from inside a container's NAT'd bridge (verified: it never establishes).
+> So run the Eufy backend on the **host** (`cd eufy && node server.js`); the dashboard
+> container reaches it via `host.docker.internal:3040` (already wired up in
+> `docker-compose.yml`). Skip the host backend if you only have Wyze cameras.
+
 **Using docker compose (recommended):**
 
 ```bash
-# Put your credentials in cam-frontend/.env first (cp from .env.example)
+# 1. Put your credentials in the repo-root .env first (cp from .env.example)
+
+# 2. (Eufy only) start the Eufy backend on the host and leave it running
+cd eufy && npm install && node server.js   # :3040 — in its own terminal
+
+# 3. Build + run the dashboard container
 docker compose up -d --build          # build + run in the background
 docker compose logs -f                # follow logs
 docker compose down                   # stop and remove the container
 ```
 
-Open <http://localhost:3030>. Login tokens are stored in the named `wyze-tokens` volume,
+Open <http://localhost:3030>. Wyze login tokens are stored in the named `wyze-tokens` volume,
 so the container won't re-authenticate on every restart.
 
 **Using plain docker:**
@@ -56,11 +85,15 @@ docker build -t wyze-cams .
 
 docker run -d --name wyze-cams \
   -p 3030:3030 \
-  --env-file cam-frontend/.env \
+  --env-file .env \
   -e PERSIST_PATH=/data \
+  -e EUFY_BASE_URL=http://host.docker.internal:3040 \
+  --add-host host.docker.internal:host-gateway \
   -v wyze-tokens:/data \
   wyze-cams
 ```
+
+(Drop the `EUFY_BASE_URL` and `--add-host` lines if you aren't running the Eufy backend.)
 
 To change the published port, map it explicitly, e.g. `-p 8080:3030`.
 

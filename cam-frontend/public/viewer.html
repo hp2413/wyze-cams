@@ -3,7 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Wyze Camera Viewer</title>
+    <title>Camera Viewer</title>
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
     <style>
       :root {
         color-scheme: dark;
@@ -112,6 +113,63 @@
         padding: 2px 7px;
         border-radius: 20px;
         white-space: nowrap;
+      }
+      .cam-vendor {
+        font-size: 0.62rem;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        padding: 2px 6px;
+        border-radius: 4px;
+        text-transform: uppercase;
+      }
+      .vendor-wyze {
+        background: #1e2a4a;
+        color: #93c5fd;
+      }
+      .vendor-eufy {
+        background: #3b2a4a;
+        color: #d8b4fe;
+      }
+      #eufyBanner {
+        display: none;
+        margin: 12px 16px 0;
+        padding: 12px 14px;
+        background: #14102a;
+        border: 1px solid #3b2a4a;
+        border-radius: 10px;
+        font-size: 0.82rem;
+        color: #d8b4fe;
+      }
+      #eufyBanner.show {
+        display: block;
+      }
+      #eufyBanner .eufy-auth-row {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      #eufyBanner img {
+        max-height: 60px;
+        background: #fff;
+        border-radius: 6px;
+      }
+      #eufyBanner input {
+        background: #0f1430;
+        color: #e8ecff;
+        border: 1px solid #33407a;
+        border-radius: 8px;
+        padding: 8px 12px;
+        font-size: 0.95rem;
+        letter-spacing: 1px;
+        flex: 1;
+        min-width: 160px;
+      }
+      #eufyBanner .eufy-err {
+        color: #fca5a5;
+        margin-top: 6px;
+        min-height: 14px;
       }
       .badge-online {
         background: #14532d;
@@ -308,7 +366,7 @@
   </head>
   <body>
     <header>
-      <h2>📷 Wyze Camera Viewer</h2>
+      <h2>📷 Camera Viewer</h2>
       <div class="toolbar">
         <button id="refreshBtn">↺ Refresh</button>
         <button id="snapshotAllBtn">📸 Snapshot All</button>
@@ -319,6 +377,7 @@
       </div>
     </header>
     <div id="statusBar">Loading cameras…</div>
+    <div id="eufyBanner"></div>
     <div id="grid"></div>
     <div id="toasts"></div>
 
@@ -816,6 +875,7 @@
             <div class="cam-tile-header">
               <span class="drag-handle" title="Drag to reorder">⠿</span>
               <span class="cam-name">${escHtml(camera.nickname)}</span>
+              <span class="cam-vendor vendor-wyze">Wyze</span>
               <span class="cam-badge ${camera.online ? "badge-online" : "badge-offline"}">
                 ${camera.online ? "Online" : "Offline"}
               </span>
@@ -913,6 +973,9 @@
       refreshBtn.addEventListener("click", async () => {
         try {
           await loadCameras();
+          // loadCameras() rebuilds the grid (wiping Eufy tiles too), so re-add
+          // Eufy cameras if that side is already connected.
+          window.reloadEufy?.();
         } catch (err) {
           statusBar.textContent = "Error: " + err.message;
         }
@@ -921,6 +984,8 @@
       snapshotAllBtn.addEventListener("click", () => {
         let delay = 0;
         for (const session of streams.values()) {
+          // Eufy sessions have no cloud snapshot — skip them.
+          if (typeof session.refreshSnapshot !== "function") continue;
           setTimeout(() => session.refreshSnapshot(), delay);
           delay += 150;
         }
@@ -1091,6 +1156,351 @@
       } else {
         stopAlerts();
       }
+
+      // ====================================================================
+      // Eufy cameras
+      // --------------------------------------------------------------------
+      // Eufy cams don't speak WebRTC; the sibling eufy/server.js process logs
+      // into the Eufy cloud, opens a P2P session, and pushes MPEG-TS over a
+      // WebSocket. This page only talks to its own origin — cam-frontend's
+      // server proxies the Eufy HTTP API (/api/eufy/*) and the video socket
+      // (/eufy-stream) through to that process. Eufy tiles live in the same
+      // grid as Wyze tiles, keyed in the shared `streams` map by serial.
+      // ====================================================================
+      const eufyBanner = document.getElementById("eufyBanner");
+      let eufyConnected = false;
+      let eufyLoaded = false;
+
+      class EufyStreamSession {
+        constructor(camera, els) {
+          this.camera = camera;
+          this.els = els;
+          this.player = null;
+          this.muted = true;
+          this.autoStarted = false;
+          this.autoStopTimer = null;
+        }
+
+        log(msg, level = "") {
+          const ts = new Date().toTimeString().slice(0, 8);
+          const line = document.createElement("div");
+          if (level) line.className = `log-${level}`;
+          line.textContent = `[${ts}] ${msg}`;
+          this.els.logEl.appendChild(line);
+          this.els.logEl.scrollTop = this.els.logEl.scrollHeight;
+        }
+
+        setBadge(text, cls) {
+          this.els.badge.textContent = text;
+          this.els.badge.className = `cam-badge ${cls}`;
+        }
+
+        setOverlay(text) {
+          if (text) {
+            this.els.overlay.textContent = text;
+            this.els.overlay.classList.remove("hidden");
+          } else {
+            this.els.overlay.classList.add("hidden");
+          }
+        }
+
+        start() {
+          if (!window.mpegts || !mpegts.isSupported()) {
+            this.log("MSE / mpegts.js not supported in this browser", "err");
+            this.setOverlay("Browser unsupported");
+            return;
+          }
+          this.stop();
+          this.setBadge("Connecting…", "badge-connecting");
+          this.setOverlay("Starting livestream…");
+          this.log("Connecting…");
+
+          const proto = location.protocol === "https:" ? "wss" : "ws";
+          const url = `${proto}://${location.host}/eufy-stream?sn=${encodeURIComponent(this.camera.sn)}`;
+
+          this.player = mpegts.createPlayer(
+            { type: "mpegts", isLive: true, url },
+            {
+              enableWorker: true,
+              liveBufferLatencyChasing: true,
+              liveBufferLatencyMaxLatency: 2.0,
+              liveBufferLatencyMinRemain: 0.5,
+            }
+          );
+          this.player.attachMediaElement(this.els.video);
+          this.els.video.muted = this.muted;
+
+          this.player.on(mpegts.Events.ERROR, (type, detail) => {
+            this.log(`Stream error: ${type} ${detail}`, "err");
+            this.setBadge("Error", "badge-error");
+            this.setOverlay(`Error: ${detail}`);
+          });
+          this.els.video.addEventListener(
+            "playing",
+            () => {
+              this.setOverlay(null);
+              this.setBadge("● Live", "badge-streaming");
+              this.log("Streaming", "ok");
+            },
+            { once: true }
+          );
+
+          this.player.load();
+          this.player.play().catch((err) => this.log(`play() failed: ${err.message}`, "err"));
+        }
+
+        stop() {
+          clearTimeout(this.autoStopTimer);
+          this.autoStopTimer = null;
+          this.autoStarted = false;
+          if (this.player) {
+            try { this.player.pause(); } catch (_) {}
+            try { this.player.unload(); } catch (_) {}
+            try { this.player.detachMediaElement(); } catch (_) {}
+            try { this.player.destroy(); } catch (_) {}
+            this.player = null;
+          }
+          this.els.video.removeAttribute("src");
+          this.setBadge(
+            this.camera.online ? "Online" : "Offline",
+            this.camera.online ? "badge-online" : "badge-offline"
+          );
+          this.setOverlay(this.camera.online ? "Click Start" : "Camera offline");
+        }
+
+        toggleMute() {
+          this.muted = !this.muted;
+          this.els.video.muted = this.muted;
+          if (this.els.muteBtn) {
+            this.els.muteBtn.textContent = this.muted ? "🔇 Muted" : "🔊 Sound";
+            this.els.muteBtn.classList.toggle("on", !this.muted);
+          }
+        }
+
+        // A detection fired: pop the live view for `ms`, then stop — but leave a
+        // manually-started stream running.
+        autoCapture(ms) {
+          if (this.player && !this.autoStarted) {
+            this.log("👤 Person detected (already streaming)", "warn");
+            return;
+          }
+          if (!this.player) this.start();
+          this.autoStarted = true;
+          clearTimeout(this.autoStopTimer);
+          this.autoStopTimer = setTimeout(() => this.stop(), ms);
+          this.log(`👤 Person detected — auto-streaming ${ms / 1000}s`, "warn");
+        }
+      }
+
+      function removeEufyTiles() {
+        for (const tile of grid.querySelectorAll('.cam-tile[data-vendor="eufy"]')) {
+          const sn = tile.dataset.mac;
+          const session = streams.get(sn);
+          if (session) {
+            session.stop();
+            streams.delete(sn);
+          }
+          tile.remove();
+        }
+      }
+
+      function buildEufyTiles(cameras) {
+        removeEufyTiles();
+        for (const camera of cameras) {
+          const tile = document.createElement("div");
+          tile.className = "cam-tile";
+          tile.draggable = true;
+          tile.dataset.mac = camera.sn; // shared ordering key (unique per cam)
+          tile.dataset.vendor = "eufy";
+          tile.innerHTML = `
+            <div class="cam-tile-header">
+              <span class="drag-handle" title="Drag to reorder">⠿</span>
+              <span class="cam-name">${escHtml(camera.name)}</span>
+              <span class="cam-vendor vendor-eufy">Eufy</span>
+              <span class="cam-badge ${camera.online ? "badge-online" : "badge-offline"}">
+                ${camera.online ? "Online" : "Offline"}
+              </span>
+              <button class="expand-btn" title="Expand / collapse">⛶</button>
+            </div>
+            <div class="cam-video-wrap">
+              <video autoplay playsinline muted></video>
+              <div class="cam-overlay">${camera.online ? "Click Start" : "Camera offline"}</div>
+            </div>
+            <div class="cam-log"></div>
+            <div class="cam-controls">
+              <button class="start-btn">▶ Start</button>
+              <button class="stop-btn">■ Stop</button>
+              <span class="ctrl-sep"></span>
+              <button class="mute-btn">🔇 Muted</button>
+            </div>`;
+          grid.appendChild(tile);
+
+          const els = {
+            video: tile.querySelector("video"),
+            overlay: tile.querySelector(".cam-overlay"),
+            badge: tile.querySelector(".cam-badge"),
+            logEl: tile.querySelector(".cam-log"),
+            muteBtn: tile.querySelector(".mute-btn"),
+          };
+          const session = new EufyStreamSession(camera, els);
+          streams.set(camera.sn, session);
+
+          tile.querySelector(".start-btn").addEventListener("click", () => session.start());
+          tile.querySelector(".stop-btn").addEventListener("click", () => session.stop());
+          els.muteBtn.addEventListener("click", () => session.toggleMute());
+          tile.querySelector(".expand-btn").addEventListener("click", () => {
+            const expanding = !tile.classList.contains("expanded");
+            tile.classList.toggle("expanded", expanding);
+            if (expanding) {
+              grid.prepend(tile);
+              tile.scrollIntoView({ behavior: "smooth", block: "start" });
+            }
+          });
+          attachDragHandlers(tile);
+        }
+        applySavedOrder();
+      }
+
+      let eufyCamRetry = null;
+      async function loadEufyCameras() {
+        clearTimeout(eufyCamRetry);
+        try {
+          const res = await fetch("/api/eufy/cameras");
+          const data = await res.json();
+          if (res.status === 503) {
+            // Cloud session not fully up yet — retry shortly.
+            eufyCamRetry = setTimeout(() => loadEufyCameras().catch(() => {}), 3000);
+            return;
+          }
+          if (!res.ok) throw new Error(data.error || "Failed to load Eufy cameras");
+          eufyLoaded = true;
+          buildEufyTiles(data.cameras || []);
+        } catch (err) {
+          eufyBanner.classList.add("show");
+          eufyBanner.innerHTML = `Eufy: ${escHtml(err.message)}`;
+        }
+      }
+
+      // Expose for the Refresh button, which rebuilds the grid (wiping Eufy
+      // tiles); re-add them if the Eufy side is connected.
+      window.reloadEufy = () => {
+        if (eufyConnected) loadEufyCameras().catch(() => {});
+      };
+
+      // --- Eufy auth (captcha / 2FA) shown inline in the banner --------------
+      let eufyAuthTimer = null;
+      let eufyAuthSig = ""; // re-render the banner only when the challenge changes
+
+      function renderEufyBanner(data) {
+        const sig = `${data.status}|${data.message || ""}`;
+        if (sig === eufyAuthSig) return; // don't clobber what the user is typing
+        eufyAuthSig = sig;
+
+        eufyBanner.classList.add("show");
+        const isCaptcha = data.status === "captcha";
+        const isTfa = data.status === "tfa";
+
+        if (isCaptcha || isTfa) {
+          eufyBanner.innerHTML = `
+            <strong>Eufy login —</strong> ${escHtml(data.message || (isCaptcha ? "Enter the captcha." : "Enter the 2FA code."))}
+            <div class="eufy-auth-row">
+              ${isCaptcha && data.captcha ? `<img src="${data.captcha}" alt="captcha" />` : ""}
+              <input id="eufyAuthInput" autocomplete="one-time-code" autocapitalize="off"
+                spellcheck="false" placeholder="Enter code" />
+              <button id="eufyAuthSubmit">Submit</button>
+            </div>
+            <div class="eufy-err" id="eufyAuthErr"></div>`;
+          const input = eufyBanner.querySelector("#eufyAuthInput");
+          input.focus();
+          eufyBanner.querySelector("#eufyAuthSubmit").addEventListener("click", submitEufyAuth);
+          input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") submitEufyAuth();
+          });
+        } else if (data.status === "error") {
+          eufyBanner.innerHTML = `<strong>Eufy login failed:</strong> ${escHtml(data.message || "")}`;
+        } else {
+          eufyBanner.innerHTML = `Eufy: ${escHtml(data.message || "Connecting…")}`;
+        }
+      }
+
+      async function submitEufyAuth() {
+        const input = eufyBanner.querySelector("#eufyAuthInput");
+        const errEl = eufyBanner.querySelector("#eufyAuthErr");
+        const code = (input?.value || "").trim();
+        if (!code) return;
+        if (errEl) errEl.textContent = "";
+        input.disabled = true;
+        try {
+          const res = await fetch("/api/eufy/auth/submit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code }),
+          });
+          const data = await res.json();
+          if (!res.ok && errEl) errEl.textContent = data.error || "Submit failed.";
+        } catch (err) {
+          if (errEl) errEl.textContent = err.message;
+        }
+        eufyAuthSig = ""; // force a re-render on the next poll
+        pollEufyAuth();
+      }
+
+      async function pollEufyAuth() {
+        clearTimeout(eufyAuthTimer);
+        let data;
+        try {
+          const res = await fetch("/api/eufy/auth/status");
+          data = await res.json();
+          if (res.status === 502) {
+            // The Eufy viewer process isn't running.
+            eufyBanner.classList.add("show");
+            eufyBanner.innerHTML = `Eufy server not reachable — start it with <code>node server.js</code> in the <code>eufy/</code> folder.`;
+            eufyAuthSig = "";
+            eufyAuthTimer = setTimeout(pollEufyAuth, 5000);
+            return;
+          }
+        } catch (_) {
+          eufyAuthTimer = setTimeout(pollEufyAuth, 4000);
+          return;
+        }
+
+        if (data.connected || data.status === "connected") {
+          eufyConnected = true;
+          eufyBanner.classList.remove("show");
+          eufyAuthSig = "";
+          if (!eufyLoaded) loadEufyCameras().catch(() => {});
+          return; // stop polling once connected
+        }
+
+        renderEufyBanner(data);
+        // Keep polling so a freshly re-issued captcha (new image) is picked up.
+        eufyAuthTimer = setTimeout(pollEufyAuth, data.status === "connecting" ? 1500 : 4000);
+      }
+
+      // --- Eufy detection events: auto-pop the live view on a person ---------
+      const EUFY_AUTO_CAPTURE_MS = 5000;
+      function initEufyEventStream() {
+        if (!window.EventSource) return;
+        const es = new EventSource("/api/eufy/events");
+        es.onmessage = (e) => {
+          let evt;
+          try {
+            evt = JSON.parse(e.data);
+          } catch (_) {
+            return;
+          }
+          if (evt.type === "person") {
+            const session = streams.get(evt.sn);
+            if (session && typeof session.autoCapture === "function") {
+              session.autoCapture(EUFY_AUTO_CAPTURE_MS);
+            }
+          }
+        };
+        es.onerror = () => {}; // EventSource auto-reconnects
+      }
+
+      pollEufyAuth();
+      initEufyEventStream();
     </script>
   </body>
 </html>
