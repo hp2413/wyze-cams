@@ -281,6 +281,20 @@
         padding: 3px 8px !important;
         font-size: 0.85rem;
       }
+      .collapse-btn {
+        padding: 0 !important;
+        font-size: 0.85rem;
+        width: 28px;
+        height: 24px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        line-height: 1;
+      }
+      .cam-tile.collapsed .cam-log,
+      .cam-tile.collapsed .cam-controls {
+        display: none;
+      }
       .cam-tile.dragging {
         opacity: 0.4;
         outline: 2px dashed #6495ed;
@@ -372,6 +386,7 @@
         <button id="snapshotAllBtn">📸 Snapshot All</button>
         <button id="startAllBtn">▶ Start All</button>
         <button id="stopAllBtn" class="danger">■ Stop All</button>
+        <button id="expandAllBtn">▾ Expand All</button>
         <button id="substreamBtn">Sub-stream: OFF</button>
         <button id="alertsBtn">🔔 Browser Alerts: OFF</button>
       </div>
@@ -392,6 +407,7 @@
       const snapshotAllBtn = document.getElementById("snapshotAllBtn");
       const startAllBtn = document.getElementById("startAllBtn");
       const stopAllBtn = document.getElementById("stopAllBtn");
+      const expandAllBtn = document.getElementById("expandAllBtn");
       const substreamBtn = document.getElementById("substreamBtn");
       const alertsBtn = document.getElementById("alertsBtn");
       const toasts = document.getElementById("toasts");
@@ -868,7 +884,7 @@
 
         for (const camera of cameraList) {
           const tile = document.createElement("div");
-          tile.className = "cam-tile";
+          tile.className = "cam-tile collapsed";
           tile.draggable = true;
           tile.dataset.mac = camera.mac;
           tile.innerHTML = `
@@ -879,6 +895,7 @@
               <span class="cam-badge ${camera.online ? "badge-online" : "badge-offline"}">
                 ${camera.online ? "Online" : "Offline"}
               </span>
+              <button class="collapse-btn" title="Show / hide controls">▾</button>
               <button class="expand-btn" title="Expand / collapse">⛶</button>
             </div>
             <div class="cam-video-wrap">
@@ -938,6 +955,13 @@
               grid.prepend(tile);
               tile.scrollIntoView({ behavior: "smooth", block: "start" });
             }
+          });
+
+          tile.querySelector(".collapse-btn").addEventListener("click", (e) => {
+            e.stopPropagation();
+            const btn = e.currentTarget;
+            const collapsed = tile.classList.toggle("collapsed");
+            btn.textContent = collapsed ? "▾" : "▴";
           });
 
           attachDragHandlers(tile);
@@ -1000,6 +1024,18 @@
       });
 
       stopAllBtn.addEventListener("click", () => streams.forEach((s) => s.stop()));
+
+      let allExpanded = false;
+      expandAllBtn.addEventListener("click", () => {
+        allExpanded = !allExpanded;
+        for (const tile of grid.querySelectorAll(".cam-tile")) {
+          tile.classList.toggle("collapsed", !allExpanded);
+          const btn = tile.querySelector(".collapse-btn");
+          if (btn) btn.textContent = allExpanded ? "▴" : "▾";
+        }
+        expandAllBtn.textContent = allExpanded ? "▴ Collapse All" : "▾ Expand All";
+        expandAllBtn.classList.toggle("active", allExpanded);
+      });
 
       // --- Event notifications -------------------------------------------
       // Wyze cloud push only reaches the phone app, so to get alerts in the
@@ -1308,7 +1344,7 @@
         removeEufyTiles();
         for (const camera of cameras) {
           const tile = document.createElement("div");
-          tile.className = "cam-tile";
+          tile.className = "cam-tile collapsed";
           tile.draggable = true;
           tile.dataset.mac = camera.sn; // shared ordering key (unique per cam)
           tile.dataset.vendor = "eufy";
@@ -1320,6 +1356,7 @@
               <span class="cam-badge ${camera.online ? "badge-online" : "badge-offline"}">
                 ${camera.online ? "Online" : "Offline"}
               </span>
+              <button class="collapse-btn" title="Show / hide controls">▾</button>
               <button class="expand-btn" title="Expand / collapse">⛶</button>
             </div>
             <div class="cam-video-wrap">
@@ -1355,6 +1392,12 @@
               grid.prepend(tile);
               tile.scrollIntoView({ behavior: "smooth", block: "start" });
             }
+          });
+          tile.querySelector(".collapse-btn").addEventListener("click", (e) => {
+            e.stopPropagation();
+            const btn = e.currentTarget;
+            const collapsed = tile.classList.toggle("collapsed");
+            btn.textContent = collapsed ? "▾" : "▴";
           });
           attachDragHandlers(tile);
         }
