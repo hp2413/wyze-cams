@@ -130,6 +130,27 @@
         background: #3b2a4a;
         color: #d8b4fe;
       }
+      .cam-battery {
+        font-size: 0.7rem;
+        padding: 2px 7px;
+        border-radius: 20px;
+        background: #14532d;
+        color: #86efac;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+      .cam-battery.battery-low {
+        background: #3b0000;
+        color: #fca5a5;
+      }
+      .cam-battery.battery-mid {
+        background: #3b2a00;
+        color: #fde68a;
+      }
+      .cam-battery.battery-charging {
+        background: #0c4a6e;
+        color: #7dd3fc;
+      }
       #eufyBanner {
         display: none;
         margin: 12px 16px 0;
@@ -224,6 +245,17 @@
         object-fit: cover;
         opacity: 0.35;
       }
+      /* Eufy thumbnails sit fully opaque over the (stopped) video, since the
+         video element holds no last-frame when the stream isn't running. While
+         streaming, the .streaming class hides the thumb. */
+      .cam-tile[data-vendor="eufy"] .cam-thumb {
+        opacity: 1;
+        object-fit: contain;
+        background: #000;
+      }
+      .cam-tile[data-vendor="eufy"].streaming .cam-thumb {
+        display: none;
+      }
       .cam-footer {
         display: flex;
         gap: 6px;
@@ -266,6 +298,14 @@
         align-self: stretch;
         background: #1e2d50;
         margin: 0 2px;
+      }
+      .cam-controls select.autosnap-select {
+        background: #1a2238;
+        color: #cbd5e1;
+        border: 1px solid #2a3960;
+        border-radius: 6px;
+        padding: 4px 6px;
+        font-size: 0.76rem;
       }
       .drag-handle {
         cursor: grab;
@@ -1308,6 +1348,97 @@
           }
         }
 
+        // Battery badge: hide when level is unknown (wired cams), otherwise
+        // render N% with a color band (red <20, amber <50, green >=50, blue
+        // while charging). Updated initially from /api/eufy/cameras, then on
+        // every SSE "battery" event.
+        setBattery(level, charging) {
+          const el = this.els.battery;
+          if (!el) return;
+          if (level == null) {
+            el.hidden = true;
+            el.textContent = "";
+            return;
+          }
+          el.hidden = false;
+          el.textContent = charging ? `⚡ ${level}%` : `🔋 ${level}%`;
+          let cls = "cam-battery";
+          if (charging) cls += " battery-charging";
+          else if (level < 20) cls += " battery-low";
+          else if (level < 50) cls += " battery-mid";
+          el.className = cls;
+        }
+
+        // Point the tile's <img> at the cached snapshot endpoint. The image is
+        // hidden via CSS while streaming and shown again on stop.
+        loadThumb(cachebust = false) {
+          if (!this.els.thumb) return;
+          const url = `/api/eufy/snapshot/${encodeURIComponent(this.camera.sn)}${cachebust ? `?t=${Date.now()}` : ""}`;
+          this.els.thumb.onerror = () => {
+            // No snapshot yet — leave the overlay text visible.
+            this.els.thumb.removeAttribute("src");
+          };
+          this.els.thumb.onload = () => {
+            // A cached thumb counts as the "stopped" view, so drop the overlay
+            // text once an image is showing.
+            if (!this.player) this.setOverlay(null);
+          };
+          this.els.thumb.src = url;
+        }
+
+        // Server-side periodic snapshot. minutes=0 disables; otherwise the
+        // Eufy backend wakes this camera every N minutes and updates the cache.
+        // The new thumbnail is pushed to all viewers over the existing SSE
+        // "snapshot" event, so no extra client-side polling is needed.
+        async setAutoSnap(minutes) {
+          try {
+            const res = await fetch(`/api/eufy/autosnap/${encodeURIComponent(this.camera.sn)}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ minutes }),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              throw new Error(data.error || `HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            const m = Number(data.minutes) || 0;
+            if (this.els.autosnapSelect) this.els.autosnapSelect.value = String(m);
+            this.log(m ? `Auto-snap every ${m} min` : "Auto-snap off", "ok");
+          } catch (err) {
+            this.log(`Auto-snap update failed: ${err.message}`, "err");
+          }
+        }
+
+        // On-demand snapshot: hits the Eufy backend which briefly wakes the
+        // camera, grabs one frame, stops the livestream, then returns the JPEG.
+        async refreshThumb() {
+          if (this.player) {
+            this.log("Stop the live view before refreshing the thumbnail.", "warn");
+            return;
+          }
+          const btn = this.els.refreshThumbBtn;
+          if (btn) btn.disabled = true;
+          this.setOverlay("Waking camera for snapshot…");
+          this.log("Refreshing snapshot (wakes camera briefly)…");
+          try {
+            const res = await fetch(`/api/eufy/snapshot/${encodeURIComponent(this.camera.sn)}/refresh`, {
+              method: "POST",
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              throw new Error(data.error || `HTTP ${res.status}`);
+            }
+            this.loadThumb(true);
+            this.log("Snapshot updated", "ok");
+          } catch (err) {
+            this.log(`Snapshot refresh failed: ${err.message}`, "err");
+            this.setOverlay(this.camera.online ? "Click Start" : "Camera offline");
+          } finally {
+            if (btn) btn.disabled = false;
+          }
+        }
+
         start() {
           if (!window.mpegts || !mpegts.isSupported()) {
             this.log("MSE / mpegts.js not supported in this browser", "err");
@@ -1315,6 +1446,7 @@
             return;
           }
           this.stop();
+          this.els.tile?.classList.add("streaming");
           this.setBadge("Connecting…", "badge-connecting");
           this.setOverlay("Starting livestream…");
           this.log("Connecting…");
@@ -1365,11 +1497,17 @@
             this.player = null;
           }
           this.els.video.removeAttribute("src");
+          this.els.tile?.classList.remove("streaming");
           this.setBadge(
             this.camera.online ? "Online" : "Offline",
             this.camera.online ? "badge-online" : "badge-offline"
           );
           this.setOverlay(this.camera.online ? "Click Start" : "Camera offline");
+          // Show whatever's in cache after a stream ends — likely the last frame
+          // we just decoded, kept warm by the snapshot cache on motion events.
+          if (this.els.thumb?.getAttribute("src")) {
+            this.setOverlay(null);
+          }
         }
 
         toggleMute() {
@@ -1420,6 +1558,7 @@
             <div class="cam-tile-header">
               <span class="drag-handle" title="Drag to reorder">⠿</span>
               <span class="cam-name">${escHtml(camera.name)}</span>
+              <span class="cam-battery" hidden></span>
               <span class="cam-vendor vendor-eufy">Eufy</span>
               <span class="cam-badge ${camera.online ? "badge-online" : "badge-offline"}">
                 ${camera.online ? "Online" : "Offline"}
@@ -1429,6 +1568,7 @@
             </div>
             <div class="cam-video-wrap">
               <video autoplay playsinline muted></video>
+              <img class="cam-thumb" alt="" />
               <div class="cam-overlay">${camera.online ? "Click Start" : "Camera offline"}</div>
             </div>
             <div class="cam-log"></div>
@@ -1438,23 +1578,51 @@
               <span class="ctrl-sep"></span>
               <button class="mute-btn">🔇 Muted</button>
               <button class="snap-btn" title="Capture frame from live view">📸 Snap</button>
+              <button class="refresh-thumb-btn" title="Wake the camera briefly to grab a fresh thumbnail">🔄 Refresh</button>
+              <select class="autosnap-select" title="Auto-refresh thumbnail (wakes camera each tick)">
+                <option value="0">Auto: Off</option>
+                <option value="1">Every 1 min</option>
+                <option value="5">Every 5 min</option>
+                <option value="15">Every 15 min</option>
+                <option value="30">Every 30 min</option>
+                <option value="60">Every 60 min</option>
+              </select>
             </div>`;
           grid.appendChild(tile);
 
           const els = {
+            tile,
             video: tile.querySelector("video"),
+            thumb: tile.querySelector(".cam-thumb"),
             overlay: tile.querySelector(".cam-overlay"),
             badge: tile.querySelector(".cam-badge"),
+            battery: tile.querySelector(".cam-battery"),
             logEl: tile.querySelector(".cam-log"),
             muteBtn: tile.querySelector(".mute-btn"),
+            refreshThumbBtn: tile.querySelector(".refresh-thumb-btn"),
+            autosnapSelect: tile.querySelector(".autosnap-select"),
           };
           const session = new EufyStreamSession(camera, els);
           streams.set(camera.sn, session);
+
+          // Render the battery badge from the initial /api/eufy/cameras payload;
+          // later changes come in over SSE ("battery" event) and call the same
+          // method.
+          session.setBattery(camera.battery, camera.batteryCharging);
+
+          // Show the last cached thumbnail straight away (no battery cost — it's
+          // either an event thumbnail from the cloud or a prior on-demand snap).
+          // 404 is fine: just leave the overlay text in place until one exists.
+          session.loadThumb();
 
           tile.querySelector(".start-btn").addEventListener("click", () => session.start());
           tile.querySelector(".stop-btn").addEventListener("click", () => session.stop());
           els.muteBtn.addEventListener("click", () => session.toggleMute());
           tile.querySelector(".snap-btn").addEventListener("click", () => captureFromVideo(session));
+          els.refreshThumbBtn.addEventListener("click", () => session.refreshThumb());
+          els.autosnapSelect.addEventListener("change", (e) => {
+            session.setAutoSnap(Number(e.target.value));
+          });
           tile.querySelector(".expand-btn").addEventListener("click", () => {
             const expanding = !tile.classList.contains("expanded");
             tile.classList.toggle("expanded", expanding);
@@ -1488,9 +1656,24 @@
           if (!res.ok) throw new Error(data.error || "Failed to load Eufy cameras");
           eufyLoaded = true;
           buildEufyTiles(data.cameras || []);
+          applyAutoSnapConfig().catch(() => {});
         } catch (err) {
           eufyBanner.classList.add("show");
           eufyBanner.innerHTML = `Eufy: ${escHtml(err.message)}`;
+        }
+      }
+
+      // Sync each Eufy tile's auto-snap dropdown to the server-persisted value.
+      // Run after tiles exist so the <select>s are in the DOM.
+      async function applyAutoSnapConfig() {
+        const res = await fetch("/api/eufy/autosnap");
+        if (!res.ok) return;
+        const { config = {} } = await res.json();
+        for (const [sn, minutes] of Object.entries(config)) {
+          const session = streams.get(sn);
+          if (session?.els?.autosnapSelect) {
+            session.els.autosnapSelect.value = String(minutes);
+          }
         }
       }
 
@@ -1606,6 +1789,23 @@
             const session = streams.get(evt.sn);
             if (session && typeof session.autoCapture === "function") {
               session.autoCapture(EUFY_AUTO_CAPTURE_MS);
+            }
+          }
+          // The backend just cached a new JPEG for this camera — reload the
+          // tile's thumbnail so it reflects the latest motion event.
+          if (evt.type === "snapshot") {
+            const session = streams.get(evt.sn);
+            if (session && typeof session.loadThumb === "function") {
+              session.loadThumb(true);
+            }
+          }
+          // Battery percentage update — fires both on SDK property change and
+          // immediately after every snapshot save (A/B/C) so each thumbnail
+          // refresh carries the latest battery reading.
+          if (evt.type === "battery") {
+            const session = streams.get(evt.sn);
+            if (session && typeof session.setBattery === "function") {
+              session.setBattery(evt.battery, evt.batteryCharging);
             }
           }
         };

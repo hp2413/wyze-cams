@@ -73,6 +73,34 @@ const sessions = new Map();
 let eufy = null;
 let connected = false;
 
+// Last-known JPEG per camera (event thumbnail from the Eufy cloud, plus any
+// on-demand snapshots we capture). Persisted to disk so restarts don't lose
+// the cached thumbnails. Keyed by device SN.
+const snapshotCache = new Map(); // sn -> { buffer, ts }
+const snapshotDir = path.resolve(
+  process.env.EUFY_SNAPSHOT_DIR ||
+    path.join(process.env.EUFY_PERSIST_DIR || path.join(__dirname, "persist"), "snapshots")
+);
+// On-demand snapshot requests waiting on a fresh livestream frame.
+const pendingSnapshots = new Map(); // sn -> { resolve, reject, timer, ff?, args? }
+
+// Per-camera auto-snapshot interval (minutes). 0 = disabled. The server runs a
+// single setInterval per camera; multiple browser tabs sharing the dashboard
+// don't cause duplicate wakes. Persisted to autosnap.json next to the snapshot
+// cache so the schedule survives restarts.
+const autoSnapMinutes = new Map(); // sn -> integer minutes (>= 1) or absent
+const autoSnapTimers = new Map(); // sn -> NodeJS.Timeout
+const ALLOWED_AUTOSNAP_MINUTES = [1, 5, 15, 30, 60];
+const autoSnapConfigPath = path.join(
+  path.dirname(
+    path.resolve(
+      process.env.EUFY_SNAPSHOT_DIR ||
+        path.join(process.env.EUFY_PERSIST_DIR || path.join(__dirname, "persist"), "snapshots")
+    )
+  ),
+  "autosnap.json"
+);
+
 // Open Server-Sent Events connections (the viewer subscribes to /api/events to
 // be told when a detection fires, so it can auto-pop the live view).
 const sseClients = new Set();
@@ -99,6 +127,123 @@ function resolveFfmpegPath() {
 
 function log(...args) {
   console.log(`[eufy ${new Date().toISOString()}]`, ...args);
+}
+
+// --- Snapshot cache (last event thumbnail + on-demand snaps) ----------------
+
+function snapshotPath(sn) {
+  return path.join(snapshotDir, `${sn}.jpg`);
+}
+
+function loadSnapshotsFromDisk() {
+  try {
+    fs.mkdirSync(snapshotDir, { recursive: true });
+    for (const file of fs.readdirSync(snapshotDir)) {
+      const m = file.match(/^(.+)\.jpg$/);
+      if (!m) continue;
+      const buffer = fs.readFileSync(path.join(snapshotDir, file));
+      const stat = fs.statSync(path.join(snapshotDir, file));
+      snapshotCache.set(m[1], { buffer, ts: stat.mtimeMs });
+    }
+    log(`Loaded ${snapshotCache.size} cached snapshot(s) from ${snapshotDir}`);
+  } catch (err) {
+    log(`Snapshot cache load failed: ${err.message}`);
+  }
+}
+
+function saveSnapshot(sn, buffer) {
+  const ts = Date.now();
+  snapshotCache.set(sn, { buffer, ts });
+  fs.writeFile(snapshotPath(sn), buffer, (err) => {
+    if (err) log(`Persist snapshot ${sn} failed: ${err.message}`);
+  });
+  broadcastEvent({ type: "snapshot", sn, ts });
+  // The SDK refreshes battery state whenever a camera wakes (motion event,
+  // on-demand refresh, or scheduled auto-snap). Push the latest value to all
+  // viewers so each thumbnail update also carries a fresh battery reading.
+  broadcastBattery(sn);
+}
+
+function broadcastBattery(sn) {
+  if (!eufy) return;
+  eufy.getDevice(sn)
+    .then((device) => {
+      if (!device || !device.isCamera?.()) return;
+      const bat = deviceBatteryInfo(device);
+      broadcastEvent({
+        type: "battery",
+        sn,
+        battery: bat.level,
+        batteryCharging: bat.charging,
+      });
+    })
+    .catch(() => { /* device not loaded yet */ });
+}
+
+// --- Auto-snapshot scheduler ------------------------------------------------
+
+function loadAutoSnapConfig() {
+  try {
+    if (!fs.existsSync(autoSnapConfigPath)) return;
+    const raw = JSON.parse(fs.readFileSync(autoSnapConfigPath, "utf8"));
+    for (const [sn, minutes] of Object.entries(raw || {})) {
+      const m = Number(minutes);
+      if (Number.isFinite(m) && m >= 1) autoSnapMinutes.set(sn, m);
+    }
+    log(`Loaded auto-snap schedule for ${autoSnapMinutes.size} camera(s).`);
+  } catch (err) {
+    log(`Auto-snap config load failed: ${err.message}`);
+  }
+}
+
+function persistAutoSnapConfig() {
+  const obj = Object.fromEntries(autoSnapMinutes.entries());
+  fs.writeFile(autoSnapConfigPath, JSON.stringify(obj, null, 2), (err) => {
+    if (err) log(`Persist auto-snap config failed: ${err.message}`);
+  });
+}
+
+function clearAutoSnapTimer(sn) {
+  const t = autoSnapTimers.get(sn);
+  if (t) clearInterval(t);
+  autoSnapTimers.delete(sn);
+}
+
+function scheduleAutoSnap(sn) {
+  clearAutoSnapTimer(sn);
+  const minutes = autoSnapMinutes.get(sn);
+  if (!minutes) return;
+  const intervalMs = minutes * 60 * 1000;
+  const timer = setInterval(() => {
+    // Skip when a viewer is already streaming this camera — the live frames
+    // are fresher than any poll could be, and refreshSnapshot() would reject.
+    if (sessions.has(sn)) return;
+    refreshSnapshot(sn).catch((err) => {
+      log(`Auto-snap ${sn} failed: ${err.message}`);
+    });
+  }, intervalMs);
+  autoSnapTimers.set(sn, timer);
+  log(`Auto-snap scheduled for ${sn} every ${minutes} min.`);
+}
+
+function setAutoSnap(sn, minutes) {
+  if (minutes === 0 || minutes === null) {
+    autoSnapMinutes.delete(sn);
+    clearAutoSnapTimer(sn);
+  } else {
+    if (!ALLOWED_AUTOSNAP_MINUTES.includes(minutes)) {
+      throw new Error(`Interval must be one of: ${ALLOWED_AUTOSNAP_MINUTES.join(", ")} (or 0 to disable)`);
+    }
+    autoSnapMinutes.set(sn, minutes);
+    scheduleAutoSnap(sn);
+  }
+  persistAutoSnapConfig();
+}
+
+// Reactivate persisted schedules once the cloud session is up and devices are
+// known. Called from the "connect" handler.
+function startAllAutoSnapTimers() {
+  for (const sn of autoSnapMinutes.keys()) scheduleAutoSnap(sn);
 }
 
 // --- Eufy cloud login (captcha / 2FA solved from the web UI) ---------------
@@ -220,6 +365,8 @@ async function initEufy() {
     auth.message = "Connected.";
     auth.captchaImage = null;
     log("Connected to Eufy cloud — loading devices…");
+    // Restart any persisted auto-snap schedules now that cloud calls work.
+    startAllAutoSnapTimers();
   });
   eufy.on("close", () => {
     connected = false;
@@ -231,6 +378,36 @@ async function initEufy() {
   });
   eufy.on("device added", (device) => {
     log(`Device: ${device.getName()} (${device.getSerial()}) camera=${device.isCamera()}`);
+    // The cloud may already have a cached last-event thumbnail for this device;
+    // grab it once so the dashboard has something to show before any motion.
+    try {
+      const pic = device.getPropertyValue("picture");
+      if (pic && pic.data && Buffer.isBuffer(pic.data) && pic.data.length > 0) {
+        saveSnapshot(device.getSerial(), pic.data);
+      }
+    } catch (_) { /* property not populated yet */ }
+  });
+
+  // Cloud-delivered event thumbnail: the SDK downloads the JPEG, attaches it to
+  // the device's "picture" property, and emits this event. Free of battery cost
+  // — the camera already woke for the motion event that produced this image.
+  // Also surface battery-level changes so the UI badge stays in sync.
+  eufy.on("device property changed", (device, name, value) => {
+    if (!device.isCamera()) return;
+    if (name === "picture") {
+      if (!value || !Buffer.isBuffer(value.data) || value.data.length === 0) return;
+      saveSnapshot(device.getSerial(), value.data);
+      return;
+    }
+    if (name === "battery" || name === "batteryIsCharging") {
+      const bat = deviceBatteryInfo(device);
+      broadcastEvent({
+        type: "battery",
+        sn: device.getSerial(),
+        battery: bat.level,
+        batteryCharging: bat.charging,
+      });
+    }
   });
 
   // Push-delivered detection. `state` is true on start, false on end — we only
@@ -248,6 +425,26 @@ async function initEufy() {
   // WebSocket session and start FFmpeg.
   eufy.on("station livestream start", (station, device, metadata, videostream, audiostream) => {
     const sn = device.getSerial();
+
+    // On-demand snapshot path takes priority: grab one frame as JPEG, then stop
+    // the livestream so the camera goes back to sleep. Battery-conscious wake.
+    const pending = pendingSnapshots.get(sn);
+    if (pending) {
+      log(`Snapshot capture ${sn} codec=${codecName(metadata)} ${metadata.videoWidth}x${metadata.videoHeight}`);
+      captureSnapshotFromStream(sn, metadata, videostream)
+        .then((buffer) => {
+          saveSnapshot(sn, buffer);
+          pending.resolve(buffer);
+        })
+        .catch((err) => pending.reject(err))
+        .finally(() => {
+          clearTimeout(pending.timer);
+          pendingSnapshots.delete(sn);
+          eufy.stopStationLivestream(sn).catch(() => {});
+        });
+      return;
+    }
+
     const session = sessions.get(sn);
     if (!session) {
       log(`Livestream started for ${sn} with no active viewer — stopping it.`);
@@ -286,16 +483,38 @@ function deviceOnline(device) {
   return true;
 }
 
+function deviceBatteryInfo(device) {
+  // Battery-powered models expose 0-100 on the "battery" property. Wired
+  // models return undefined; we surface that as null so the UI hides the
+  // badge instead of showing 0%.
+  let level = null;
+  let charging = false;
+  try {
+    const v = device.getPropertyValue("battery");
+    if (typeof v === "number" && v >= 0 && v <= 100) level = v;
+  } catch (_) { /* not present */ }
+  try {
+    const c = device.getPropertyValue("batteryIsCharging");
+    if (typeof c === "boolean") charging = c;
+  } catch (_) { /* not present */ }
+  return { level, charging };
+}
+
 async function getCameras() {
   const devices = await eufy.getDevices();
   return devices
     .filter((d) => d.isCamera())
-    .map((d) => ({
-      sn: d.getSerial(),
-      name: d.getName(),
-      model: d.getModel(),
-      online: deviceOnline(d),
-    }));
+    .map((d) => {
+      const bat = deviceBatteryInfo(d);
+      return {
+        sn: d.getSerial(),
+        name: d.getName(),
+        model: d.getModel(),
+        online: deviceOnline(d),
+        battery: bat.level,
+        batteryCharging: bat.charging,
+      };
+    });
 }
 
 // --- FFmpeg: raw eufy streams -> MPEG-TS over the WebSocket -----------------
@@ -362,6 +581,83 @@ function startFfmpeg(session, metadata, videostream, audiostream) {
   ff.on("close", (code) => {
     log(`ffmpeg[${session.sn}] exited (${code})`);
   });
+}
+
+// --- On-demand snapshot: short livestream → one JPEG frame → stop ----------
+//
+// Wake the camera just long enough to grab a single frame. Pipes the raw video
+// elementary stream into FFmpeg with `-frames:v 1 -f mjpeg pipe:1`, collects
+// stdout, and resolves with the resulting JPEG buffer.
+function captureSnapshotFromStream(sn, metadata, videostream) {
+  return new Promise((resolve, reject) => {
+    const isH265 = metadata.videoCodec === VideoCodec.H265;
+    const args = [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-fflags", "+nobuffer+genpts",
+      "-f", isH265 ? "hevc" : "h264",
+      "-i", "pipe:0",
+      "-frames:v", "1",
+      "-q:v", "4",
+      "-f", "mjpeg",
+      "pipe:1",
+    ];
+    const ff = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const chunks = [];
+    let settled = false;
+    const finish = (err, buffer) => {
+      if (settled) return;
+      settled = true;
+      try { videostream.unpipe?.(ff.stdin); } catch (_) {}
+      try { ff.kill("SIGKILL"); } catch (_) {}
+      if (err) return reject(err);
+      if (!buffer || buffer.length === 0) return reject(new Error("Empty snapshot"));
+      resolve(buffer);
+    };
+    ff.stdout.on("data", (c) => chunks.push(c));
+    ff.stderr.on("data", (d) => {
+      const msg = d.toString().trim();
+      if (msg) log(`ffmpeg[snap ${sn}] ${msg}`);
+    });
+    ff.on("close", () => finish(null, Buffer.concat(chunks)));
+    ff.on("error", (e) => finish(e));
+    videostream.on("error", () => {});
+    videostream.pipe(ff.stdin);
+    ff.stdin.on("error", () => {});
+    // Watchdog: ffmpeg should emit a frame within a few seconds of livestream
+    // start. If not, give up so the camera doesn't stay awake on a stuck pipe.
+    setTimeout(() => finish(new Error("Snapshot capture timed out")), 10000);
+  });
+}
+
+async function refreshSnapshot(sn) {
+  if (!connected) throw new Error("Not connected to Eufy cloud");
+  if (sessions.has(sn)) {
+    throw new Error("Live viewer active — stop it first, or the existing stream is your snapshot.");
+  }
+  const existing = pendingSnapshots.get(sn);
+  if (existing) return existing.promise;
+
+  let resolveOuter, rejectOuter;
+  const promise = new Promise((resolve, reject) => {
+    resolveOuter = resolve;
+    rejectOuter = reject;
+  });
+  const timer = setTimeout(() => {
+    pendingSnapshots.delete(sn);
+    eufy.stopStationLivestream(sn).catch(() => {});
+    rejectOuter(new Error("Snapshot timed out waiting for livestream"));
+  }, 15000);
+  pendingSnapshots.set(sn, { resolve: resolveOuter, reject: rejectOuter, timer, promise });
+
+  try {
+    await eufy.startStationLivestream(sn);
+  } catch (err) {
+    clearTimeout(timer);
+    pendingSnapshots.delete(sn);
+    throw err;
+  }
+  return promise;
 }
 
 async function startSession(sn, ws) {
@@ -549,6 +845,87 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Last cached JPEG for a camera (event thumbnail from the cloud, or a
+    // previous on-demand snap). Returns 404 until at least one image exists.
+    const snapMatch = requestUrl.pathname.match(/^\/api\/snapshot\/([^/]+)$/);
+    if (req.method === "GET" && snapMatch) {
+      const sn = decodeURIComponent(snapMatch[1]);
+      const entry = snapshotCache.get(sn);
+      if (!entry) {
+        sendJson(res, 404, { error: "No snapshot yet" });
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "image/jpeg",
+        "Content-Length": entry.buffer.length,
+        "Cache-Control": "no-store",
+        "X-Snapshot-Ts": String(entry.ts),
+      });
+      res.end(entry.buffer);
+      return;
+    }
+
+    // Force a fresh snapshot: wakes the camera briefly, captures one frame,
+    // stops the livestream. Returns the new JPEG (and broadcasts an SSE event
+    // so other viewers refresh their cached image).
+    const refreshMatch = requestUrl.pathname.match(/^\/api\/snapshot\/([^/]+)\/refresh$/);
+    if (req.method === "POST" && refreshMatch) {
+      const sn = decodeURIComponent(refreshMatch[1]);
+      try {
+        const buffer = await refreshSnapshot(sn);
+        res.writeHead(200, {
+          "Content-Type": "image/jpeg",
+          "Content-Length": buffer.length,
+          "Cache-Control": "no-store",
+          "X-Snapshot-Ts": String(snapshotCache.get(sn)?.ts ?? Date.now()),
+        });
+        res.end(buffer);
+      } catch (err) {
+        sendJson(res, 502, { error: err.message });
+      }
+      return;
+    }
+
+    // List the full auto-snapshot schedule. UI uses this on tile build to set
+    // each dropdown to the persisted value.
+    if (req.method === "GET" && requestUrl.pathname === "/api/autosnap") {
+      sendJson(res, 200, {
+        allowed: ALLOWED_AUTOSNAP_MINUTES,
+        config: Object.fromEntries(autoSnapMinutes.entries()),
+      });
+      return;
+    }
+
+    // Per-camera schedule update: { minutes: 0 | 1 | 5 | 15 | 30 | 60 }.
+    // minutes=0 disables polling for that camera.
+    const autosnapMatch = requestUrl.pathname.match(/^\/api\/autosnap\/([^/]+)$/);
+    if (req.method === "POST" && autosnapMatch) {
+      const sn = decodeURIComponent(autosnapMatch[1]);
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        sendJson(res, 400, { error: err.message });
+        return;
+      }
+      const minutes = Number(body.minutes);
+      if (!Number.isFinite(minutes) || minutes < 0) {
+        sendJson(res, 400, { error: "minutes must be a non-negative number" });
+        return;
+      }
+      try {
+        setAutoSnap(sn, minutes);
+      } catch (err) {
+        sendJson(res, 400, { error: err.message });
+        return;
+      }
+      sendJson(res, 200, {
+        sn,
+        minutes: autoSnapMinutes.get(sn) ?? 0,
+      });
+      return;
+    }
+
     sendJson(res, 404, { error: "Not found" });
   } catch (error) {
     sendJson(res, 500, { error: error.message });
@@ -581,6 +958,8 @@ server.on("upgrade", (req, socket, head) => {
 
 (async () => {
   try {
+    loadSnapshotsFromDisk();
+    loadAutoSnapConfig();
     await initEufy();
   } catch (err) {
     console.error("Failed to initialize Eufy:", err.message);
@@ -593,6 +972,7 @@ server.on("upgrade", (req, socket, head) => {
 
 process.on("SIGINT", async () => {
   log("Shutting down…");
+  for (const sn of [...autoSnapTimers.keys()]) clearAutoSnapTimer(sn);
   for (const sn of [...sessions.keys()]) await stopSession(sn).catch(() => {});
   try { await eufy?.close(); } catch (_) {}
   process.exit(0);

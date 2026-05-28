@@ -157,10 +157,29 @@ const server = http.createServer(async (req, res) => {
       "GET /api/eufy/auth/status": "/api/auth/status",
       "POST /api/eufy/auth/submit": "/api/auth/submit",
       "GET /api/eufy/events": "/api/events",
+      "GET /api/eufy/autosnap": "/api/autosnap",
     };
     const eufyTarget = EUFY_PROXY[`${req.method} ${requestUrl.pathname}`];
     if (eufyTarget) {
       proxyToEufy(req, res, eufyTarget);
+      return;
+    }
+    // Snapshot routes use a wildcard segment (the camera SN), so they don't
+    // fit in the static map above. /api/eufy/snapshot/<sn> and .../refresh both
+    // forward to the matching path on eufy/server.js untouched.
+    const eufySnapGet = requestUrl.pathname.match(/^\/api\/eufy\/snapshot\/([^/]+)$/);
+    if (req.method === "GET" && eufySnapGet) {
+      proxyToEufy(req, res, `/api/snapshot/${eufySnapGet[1]}`);
+      return;
+    }
+    const eufySnapRefresh = requestUrl.pathname.match(/^\/api\/eufy\/snapshot\/([^/]+)\/refresh$/);
+    if (req.method === "POST" && eufySnapRefresh) {
+      proxyToEufy(req, res, `/api/snapshot/${eufySnapRefresh[1]}/refresh`);
+      return;
+    }
+    const eufyAutoSnapSet = requestUrl.pathname.match(/^\/api\/eufy\/autosnap\/([^/]+)$/);
+    if (req.method === "POST" && eufyAutoSnapSet) {
+      proxyToEufy(req, res, `/api/autosnap/${eufyAutoSnapSet[1]}`);
       return;
     }
 

@@ -1,0 +1,13 @@
+[eufy 2026-05-28T01:41:14.480Z] Loaded 2 cached snapshot(s) from /Users/harsh_1301/Work/AI/CAM/wyze-cams/eufy/persist/snapshots
+[eufy 2026-05-28T01:41:14.481Z] Loaded auto-snap schedule for 2 camera(s).
+[eufy 2026-05-28T01:41:16.101Z] Login attempt sent. Open the viewer to solve any captcha/2FA challenge.
+[eufy 2026-05-28T01:41:16.102Z] Eufy viewer running: http://localhost:3040
+[eufy 2026-05-28T01:41:17.840Z] Device: Side Door (T8134P1023202A0F) camera=true
+[eufy 2026-05-28T01:41:17.856Z] Device: Backyard (T8134P20232423CE) camera=true
+[eufy 2026-05-28T01:41:17.867Z] Connected to Eufy cloud — loading devices…
+[eufy 2026-05-28T01:41:17.867Z] Auto-snap scheduled for T8134P20232423CE every 5 min.
+[eufy 2026-05-28T01:41:17.868Z] Auto-snap scheduled for T8134P1023202A0F every 5 min.
+[eufy 2026-05-28T01:41:48.289Z] Snapshot capture T8134P20232423CE codec=H264 1920x1080
+[eufy 2026-05-28T01:41:50.986Z] Snapshot capture T8134P1023202A0F codec=H264 1920x1080
+[eufy 2026-05-28T01:41:55.508Z] Livestream stop T8134P20232423CE
+[eufy 2026-05-28T01:41:58.032Z] Livestream stop T8134P1023202A0F
