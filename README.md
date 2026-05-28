@@ -18,6 +18,9 @@
   cloud, opens a P2P session, and transcodes to MPEG-TS with ffmpeg. The dashboard proxies
   that backend (`/api/eufy/*` and the `/eufy-stream` WebSocket), so the browser only ever
   talks to a single origin. Eufy tiles appear in the same grid, tagged with an **Eufy** chip.
+  Because most Eufy cams are battery-powered, the dashboard never auto-streams them — each
+  tile shows a thumbnail by default and only goes live when you click ▶ Start. See
+  *Battery-friendly thumbnails* below.
 
 Both apps read a **single shared `.env` at the repo root** — credentials live in one place.
 
@@ -61,7 +64,7 @@ system ffmpeg needed.
 > container reaches it via `host.docker.internal:3040` (already wired up in
 > `docker-compose.yml`). Skip the host backend if you only have Wyze cameras.
 
-**Using docker compose (recommended):**
+**Using docker compose (recommended) (MAIN):**
 
 ```bash
 # 1. Put your credentials in the repo-root .env first (cp from .env.example)
@@ -96,6 +99,44 @@ docker run -d --name wyze-cams \
 (Drop the `EUFY_BASE_URL` and `--add-host` lines if you aren't running the Eufy backend.)
 
 To change the published port, map it explicitly, e.g. `-p 8080:3030`.
+
+### Battery-friendly thumbnails (Eufy only)
+
+Battery Eufy cams drain quickly when streaming, so each Eufy tile in the dashboard shows a
+still thumbnail until you actively click ▶ Start. Three update mechanisms feed the thumbnail
+(all proxied through the dashboard at `/api/eufy/*`, backed by `eufy/server.js`):
+
+- **A — Cloud event thumbnail (free).** The Eufy cloud already saves a JPEG when the camera
+  fires a motion event. The backend caches each one to disk (`$EUFY_PERSIST_DIR/snapshots/`)
+  and pushes it to open browser tabs over SSE. No extra wake-ups.
+- **B — On-demand snapshot (low cost).** Click the **🔄 Refresh** button on an Eufy tile:
+  the backend briefly wakes the camera, captures one frame as JPEG, and stops the livestream.
+- **C — Periodic snapshot (medium cost).** Each Eufy tile has an **Auto** dropdown
+  (`Off / 1 / 5 / 15 / 30 / 60 min`). When set, the backend runs a single per-camera timer
+  that fires the same on-demand capture on that cadence. Server-side so two open tabs share
+  one wake per tick. Pauses automatically while a live viewer is active. Persisted across
+  restarts in `$EUFY_PERSIST_DIR/autosnap.json`.
+
+With Auto = Off (default), only A + B are active. Every tile also shows a live **🔋 N%**
+battery badge in its header (⚡ blue while charging, green/amber/red by level), refreshed
+on each snapshot event and on SDK property updates.
+
+Dashboard / Eufy backend routes added for this:
+
+| Dashboard route (proxied) | Eufy backend route | Method |
+| --- | --- | --- |
+| `/api/eufy/snapshot/:sn` | `/api/snapshot/:sn` | `GET` — latest cached JPEG |
+| `/api/eufy/snapshot/:sn/refresh` | `/api/snapshot/:sn/refresh` | `POST` — wake + capture one frame |
+| `/api/eufy/autosnap` | `/api/autosnap` | `GET` — `{ allowed, config: { sn: minutes } }` |
+| `/api/eufy/autosnap/:sn` | `/api/autosnap/:sn` | `POST` — `{ minutes: 0\|1\|5\|15\|30\|60 }` |
+
+`GET /api/eufy/cameras` now also returns `battery` and `batteryCharging`. The
+`GET /api/eufy/events` SSE stream emits `{type: "snapshot", sn, ts}` and
+`{type: "battery", sn, battery, batteryCharging}` events alongside the existing
+`{type: "person", ...}` motion events.
+
+See `eufy/README.md` for the full backend reference, environment variables, and the file
+layout of `EUFY_PERSIST_DIR`.
 
 ---
 

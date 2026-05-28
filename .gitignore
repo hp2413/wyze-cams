@@ -7,6 +7,6 @@ node_modules
 # ignore any persisted token files
 wyze-*.json
 example/scratch/*
-
+eufy/eufy.log
 # Claude Code worktree state
 .claude/
