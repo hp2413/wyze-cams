@@ -16,6 +16,9 @@ services:
       # `node server.js` in eufy/ on the HOST and reach it here via the Docker
       # host gateway. (Only the Wyze dashboard is containerized.)
       - EUFY_BASE_URL=http://host.docker.internal:3040
+      # Auto-start every Wyze tile on page load so the dashboard shows live
+      # video immediately. Eufy tiles are excluded — they still need a click.
+      - AUTO_START_STREAMS=1
     extra_hosts:
       # host.docker.internal resolves to the host on Docker Desktop automatically;
       # this mapping makes it work on plain Linux Docker too.

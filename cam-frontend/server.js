@@ -288,6 +288,17 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Runtime config for the client. AUTO_START_STREAMS=1 (set in docker-compose)
+    // tells the viewer to auto-start every Wyze tile on page load so the
+    // dashboard shows live video immediately in deployed/containerized runs.
+    // Eufy tiles are intentionally excluded.
+    if (req.method === "GET" && requestUrl.pathname === "/api/config") {
+      const flag = String(process.env.AUTO_START_STREAMS || "").toLowerCase();
+      const autoStartStreams = flag === "1" || flag === "true" || flag === "yes";
+      sendJson(res, 200, { autoStartStreams });
+      return;
+    }
+
     // Debug: dump the raw device list so you can confirm which fields exist
     // (e.g., conn_state vs device_params.status). Useful when cameraIsOnline
     // is wrong.

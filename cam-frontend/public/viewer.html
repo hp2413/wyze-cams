@@ -995,6 +995,31 @@
         statusBar.textContent = `${cameras.length} cameras — ${online} online`;
       }
 
+      // When the server reports AUTO_START_STREAMS (set in docker-compose for the
+      // deployed container build), start every online Wyze tile sequentially so
+      // the page renders live video without the user clicking "Start All".
+      // Eufy tiles are intentionally skipped — they need P2P which doesn't run
+      // in the container and they remain manual-start by design.
+      let autoStartTriggered = false;
+      async function maybeAutoStartWyze() {
+        if (autoStartTriggered) return;
+        try {
+          const res = await fetch("/api/config");
+          if (!res.ok) return;
+          const cfg = await res.json();
+          if (!cfg.autoStartStreams) return;
+        } catch {
+          return;
+        }
+        autoStartTriggered = true;
+        for (const tile of grid.querySelectorAll('.cam-tile:not([data-vendor="eufy"])')) {
+          const session = streams.get(tile.dataset.mac);
+          if (!session || !session.camera.online) continue;
+          await session.start();
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+
       refreshBtn.addEventListener("click", async () => {
         try {
           await loadCameras();
@@ -1210,9 +1235,11 @@
         startAlerts();
       });
 
-      loadCameras().catch((err) => {
-        statusBar.textContent = "Error: " + err.message;
-      });
+      loadCameras()
+        .then(() => maybeAutoStartWyze())
+        .catch((err) => {
+          statusBar.textContent = "Error: " + err.message;
+        });
 
       // Default ON for each browser unless the user previously turned it off.
       if (alertsEnabledPref()) {
