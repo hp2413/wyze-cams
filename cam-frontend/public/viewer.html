@@ -878,15 +878,25 @@
       }
 
       function buildGrid(cameraList) {
-        streams.forEach((s) => s.stop());
-        streams.clear();
-        grid.innerHTML = "";
+        // Preserve Eufy tiles + their sessions — only rebuild Wyze tiles. Eufy
+        // tiles arrive from a separate async path (pollEufyAuth → loadEufyCameras)
+        // that can race with this one; wiping the whole grid drops them.
+        for (const tile of grid.querySelectorAll('.cam-tile:not([data-vendor="eufy"])')) {
+          const mac = tile.dataset.mac;
+          const session = streams.get(mac);
+          if (session) {
+            session.stop();
+            streams.delete(mac);
+          }
+          tile.remove();
+        }
 
         for (const camera of cameraList) {
           const tile = document.createElement("div");
           tile.className = "cam-tile collapsed";
           tile.draggable = true;
           tile.dataset.mac = camera.mac;
+          tile.dataset.vendor = "wyze";
           tile.innerHTML = `
             <div class="cam-tile-header">
               <span class="drag-handle" title="Drag to reorder">⠿</span>
